@@ -1,0 +1,12 @@
+{
+  "version": 0,
+  "descriptorPath": ".papi/descriptors",
+  "entries": {
+    "numen": {
+      "wsUrl": "ws://127.0.0.1:9944",
+      "metadata": ".papi/metadata/numen.scale",
+      "genesis": "0x7b7c7b93a0454cf907b400703e67691394db8558bb07d470af3d0ac510d91904",
+      "codeHash": "0x0a10d2622aa53febb86117a98bb274bfb2073179404b428e85edb7c3fe01f9ab"
+    }
+  }
+}

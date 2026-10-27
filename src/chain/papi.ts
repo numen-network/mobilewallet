@@ -1,0 +1,1684 @@
+import { hexToU8a, isHex } from '@polkadot/util'
+import { blake2AsHex } from '@polkadot/util-crypto'
+import {
+  IdentityData,
+  numen,
+  type ChildBountyStatus,
+  type NumenCallData,
+  type ReferendaTypesCurve,
+} from '@polkadot-api/descriptors'
+import {
+  Binary,
+  createClient,
+  Enum,
+  getTypedCodecs,
+  InvalidTxError,
+  type PolkadotClient,
+  type TxCallData,
+  type TypedApi,
+} from 'polkadot-api'
+import { getFakeTxCreator } from 'polkadot-api/tx-creator'
+import { getWsProvider } from 'polkadot-api/ws'
+import {
+  balanceOfCall,
+  DECIMALS_CALL,
+  NAME_CALL,
+  readBalance,
+  readToken,
+  SYMBOL_CALL,
+} from '@/evm/erc20'
+import { palletAccount } from '@/lib/address'
+import type { WalletAccount } from '@/signing/types'
+import { DECIMALS, SS58_PREFIX, TOKENS, type Network } from './config'
+import { ChainError, refusalMessage, type Validity } from './refusal'
+import {
+  hasRefund,
+  metadataDump,
+  NO_METADATA,
+  originOf,
+  readMeta,
+  readVoteByte,
+  readableTrack,
+  voteByte,
+  type CastVote,
+  type ClassLock,
+  type Curve,
+  type Metadata,
+  type Motion,
+  type NotedPreimage,
+  type Proposal,
+  type ProposalSpend,
+  type Referendum,
+  type Outcome,
+  type PollOutcome,
+  type ReferendumState,
+  type Settled,
+  type Spend,
+  type Track,
+} from './governance'
+
+import {
+  IDENTITY_FIELDS,
+  type IdentityField,
+  type IdentityInfo,
+  type Registrar,
+  type Registration,
+  type Standing,
+  type Subs,
+  type UsernameAuthority,
+} from './identity'
+import type { Bounty, BountyState, ChildBounty, ChildState } from './bounties'
+import type { SessionKeys, ValidatorRecord, ValidatorSet } from './validator'
+import type { Vesting } from './vesting'
+import {
+  batched,
+  packed,
+  transferableOf,
+  type AccountBalance,
+  type ChainFacts,
+  type ChainHead,
+  type ChainRepository,
+  type Operation,
+  type Pending,
+  type Proxy,
+  type Reach,
+  type ReadCall,
+  type Timepoint,
+  type Token,
+  type TrackVoting,
+  type TxProgress,
+  type Unsubscribe,
+} from './types'
+
+type Api = TypedApi<typeof numen>
+
+/** The three amounts of System.Account a balance is worked out from. */
+interface AccountInfo {
+  data: { free: bigint; reserved: bigint; frozen: bigint }
+}
+
+/** What every call the api builds comes back as. */
+type Tx = ReturnType<Api['tx']['Utility']['batch_all']>
+
+/** What system_health answers with, which is a legacy call and so untyped. */
+interface Health {
+  peers: number
+  isSyncing: boolean
+}
+
+/**
+ * PAPI types a decoded call loosely whichever way it came in. The runtime's
+ * own metadata built it, so it is one of the runtime's calls.
+ */
+const asCall = (call: TxCallData): NumenCallData => call as NumenCallData
+
+type ReferendumInfo = NonNullable<
+  Awaited<ReturnType<Api['query']['Referenda']['ReferendumInfoFor']['getValue']>>
+>
+type AccountVote = Extract<
+  Awaited<ReturnType<Api['query']['ConvictionVoting']['VotingFor']['getValue']>>,
+  { type: 'Casting' }
+>['value']['votes'][number][1]
+
+/**
+ * A split vote names no side and carries no conviction, so the chain frees it
+ * as soon as the referendum is over.
+ */
+function toCast(vote: AccountVote): Pick<CastVote, 'side' | 'conviction' | 'amount'> {
+  switch (vote.type) {
+    case 'Standard':
+      return { ...readVoteByte(vote.value.vote), amount: vote.value.balance }
+    case 'Split':
+      return { side: 'split', conviction: 'None', amount: vote.value.aye + vote.value.nay }
+    case 'SplitAbstain':
+      return {
+        side: 'abstain',
+        conviction: 'None',
+        amount: vote.value.aye + vote.value.nay + vote.value.abstain,
+      }
+  }
+}
+
+type ReferendumStatus = Extract<ReferendumInfo, { type: 'Ongoing' }>['value']
+type TrackInfo = Awaited<ReturnType<Api['constants']['Referenda']['Tracks']>>[number][1]
+type CustomOrigin = Extract<
+  Parameters<Api['tx']['Referenda']['submit']>[0]['proposal_origin'],
+  { type: 'Origins' }
+>['value']['type']
+type BountyStatus = Awaited<
+  ReturnType<Api['query']['Bounties']['Bounties']['getEntries']>
+>[number]['value']['status']
+
+/**
+ * Governance and identity are read from the best block rather than the finalized
+ * one. A vote or a registration that only appears once finality catches up reads
+ * as a call that did nothing. Balances stay on finality, where a number that
+ * turns out not to exist costs more than one that shows up late.
+ */
+const BEST = { at: 'best' } as const
+
+/** The id pallet_vesting files its lock under, a pallet constant the metadata leaves out. */
+const VESTING_LOCK = Binary.toHex(Binary.fromText('vesting '))
+
+/** What frame_support takes inline, past which a proposal has to be a preimage. */
+const INLINE_BOUND = 128
+
+const CHILD_STATES: Record<ChildBountyStatus['type'], ChildState> = {
+  Added: 'added',
+  CuratorProposed: 'curatorProposed',
+  Active: 'active',
+  PendingPayout: 'pendingPayout',
+}
+
+/** ApprovedWithCurator reads as approved, since nothing may be done to either. */
+const BOUNTY_STATES: Record<BountyStatus['type'], BountyState> = {
+  Proposed: 'proposed',
+  Approved: 'approved',
+  ApprovedWithCurator: 'approved',
+  Funded: 'funded',
+  CuratorProposed: 'curatorProposed',
+  Active: 'active',
+  PendingPayout: 'pendingPayout',
+}
+
+/** Who is on a bounty and the block that matters next, which only some states carry. */
+function bountyHolders(status: BountyStatus): Pick<Bounty, 'curator' | 'beneficiary' | 'until'> {
+  switch (status.type) {
+    case 'Proposed':
+    case 'Approved':
+    case 'Funded':
+      return { curator: null, beneficiary: null, until: null }
+    case 'CuratorProposed':
+    case 'ApprovedWithCurator':
+      return { curator: status.value.curator, beneficiary: null, until: null }
+    case 'Active':
+      return { curator: status.value.curator, beneficiary: null, until: status.value.update_due }
+    case 'PendingPayout':
+      return {
+        curator: status.value.curator,
+        beneficiary: status.value.beneficiary,
+        until: status.value.unlock_at,
+      }
+  }
+}
+
+function childHolders(
+  status: ChildBountyStatus,
+): Pick<ChildBounty, 'curator' | 'beneficiary' | 'until'> {
+  switch (status.type) {
+    case 'Added':
+      return { curator: null, beneficiary: null, until: null }
+    case 'CuratorProposed':
+    case 'Active':
+      return { curator: status.value.curator, beneficiary: null, until: null }
+    case 'PendingPayout':
+      return {
+        curator: status.value.curator,
+        beneficiary: status.value.beneficiary,
+        until: status.value.unlock_at,
+      }
+  }
+}
+
+/** Killed is left out, since it keeps no deposit for anybody to ask back. */
+const OUTCOMES: Record<'Approved' | 'Rejected' | 'TimedOut' | 'Cancelled', Outcome> = {
+  Approved: 'approved',
+  Rejected: 'rejected',
+  TimedOut: 'timedOut',
+  Cancelled: 'cancelled',
+}
+
+const encoder = new TextEncoder()
+const decoder = new TextDecoder()
+
+const toHex = (bytes: Uint8Array): string =>
+  `0x${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`
+
+/** How far into a call's own structure is worth writing out before it is noise. */
+const DEEP = 4
+
+/** How deep a proposal may nest batches before the walk gives up on it. */
+const PROPOSAL_DEPTH = 4
+
+/** Bytes, whether the codec handed them over raw or wrapped. */
+const asBytes = (value: unknown): Uint8Array | null => {
+  if (value instanceof Uint8Array) return value
+  const wrapped = value as { asBytes?: () => Uint8Array }
+  return typeof wrapped?.asBytes === 'function' ? wrapped.asBytes() : null
+}
+
+/**
+ * Data carries its byte length in the variant name, and PAPI wants a fixed size
+ * field as a hex string, except the one byte case where its codec takes the
+ * bare number and rejects hex. Only sub account names still go through here.
+ */
+function toData(text: string): IdentityData {
+  if (text === '') return IdentityData.None()
+  const bytes = encoder.encode(text)
+  if (bytes.length === 1) return IdentityData.Raw1(bytes[0]!)
+  return { type: `Raw${bytes.length}`, value: toHex(bytes) } as IdentityData
+}
+
+/** Anything the chain holds as a hash rather than as text reads back as empty. */
+function fromData(data: IdentityData | undefined): string {
+  if (!data?.type.startsWith('Raw') || !data.value) return ''
+  if (typeof data.value === 'number') return decoder.decode(Uint8Array.of(data.value))
+  const bytes = data.value.slice(2).match(/../g) ?? []
+  return decoder.decode(Uint8Array.from(bytes, (byte) => parseInt(byte, 16)))
+}
+
+/** As the runtime's IdentityInfo has it, matching the wallet's field for field. */
+type ChainIdentityInfo = Parameters<Api['tx']['Identity']['set_identity']>[0]['info']
+
+/** Every field carried across, so a field one side lacks fails to compile. */
+const mapFields = <From, To>(
+  info: Record<IdentityField, From>,
+  read: (value: From) => To,
+): Record<IdentityField, To> =>
+  Object.fromEntries(IDENTITY_FIELDS.map((field) => [field, read(info[field])])) as Record<
+    IdentityField,
+    To
+  >
+
+const toIdentityInfo = (info: ChainIdentityInfo): IdentityInfo => mapFields(info, Binary.toText)
+
+const fromIdentityInfo = (info: IdentityInfo): ChainIdentityInfo =>
+  mapFields(info, Binary.fromText)
+
+/** Perbill and FixedI64 both scale by a billion, which is all the curves need. */
+const BILLIONTHS = 1_000_000_000
+
+/**
+ * Numen builds thresholds with `Curve::make_linear` and `Curve::make_reciprocal`,
+ * so a stepped one is the runtime having changed under the wallet rather than
+ * something to draw around.
+ */
+function toCurve(curve: ReferendaTypesCurve): Curve {
+  switch (curve.type) {
+    case 'LinearDecreasing':
+      return {
+        kind: 'linear',
+        length: curve.value.length / BILLIONTHS,
+        floor: curve.value.floor / BILLIONTHS,
+        ceil: curve.value.ceil / BILLIONTHS,
+      }
+    case 'Reciprocal':
+      return {
+        kind: 'reciprocal',
+        factor: Number(curve.value.factor) / BILLIONTHS,
+        xOffset: Number(curve.value.x_offset) / BILLIONTHS,
+        yOffset: Number(curve.value.y_offset) / BILLIONTHS,
+      }
+    default:
+      throw new Error(`Referenda: ${curve.type} curve`)
+  }
+}
+
+const toTrack = ([id, info]: [number, TrackInfo]): Track => ({
+  id,
+  name: readableTrack(info.name),
+  origin: originOf(info.name),
+  decisionDeposit: info.decision_deposit,
+  preparePeriod: info.prepare_period,
+  decisionPeriod: info.decision_period,
+  confirmPeriod: info.confirm_period,
+  minEnactmentPeriod: info.min_enactment_period,
+  maxDeciding: info.max_deciding,
+  approvalCurve: toCurve(info.min_approval),
+  supportCurve: toCurve(info.min_support),
+})
+
+/**
+ * The four an Ongoing referendum passes through. Nothing has been decided until
+ * `deciding` is set, and `in_queue` says whether it is waiting on its prepare
+ * period or on a track with every deciding slot taken.
+ */
+export function toState(
+  status: Pick<ReferendumStatus, 'deciding' | 'in_queue'>,
+): ReferendumState {
+  if (!status.deciding) return status.in_queue ? 'queued' : 'preparing'
+  return status.deciding.confirming === undefined ? 'deciding' : 'confirming'
+}
+
+function toBalance(info: AccountInfo, existentialDeposit: bigint): AccountBalance {
+  const { free, reserved, frozen } = info.data
+  return {
+    free,
+    reserved,
+    frozen,
+    transferable: transferableOf(free, reserved, frozen, existentialDeposit),
+  }
+}
+
+/**
+ * Turns a failed dispatch into something a user can read. A module error holds
+ * the pallet that refused the call and, inside that, what it refused it for, so
+ * anything that stops at the first level names the pallet and never the reason.
+ */
+function dispatchMessage(error: { type: string; value: unknown }): string {
+  const inner = error.value as { type?: string; value?: { type?: string } } | undefined
+  if (!inner?.type) return error.type
+  return inner.value?.type ? `${inner.type}: ${inner.value.type}` : `${error.type}: ${inner.type}`
+}
+
+/**
+ * A refusal from the node itself, which never reaches a block and so never
+ * carries a dispatch error. Only the raw JSON papi prints comes with it.
+ */
+function refused(problem: unknown): Error {
+  if (problem instanceof InvalidTxError) {
+    return new ChainError(refusalMessage(problem.error as Validity), problem.message)
+  }
+  return problem instanceof Error ? problem : new Error('The chain refused it')
+}
+
+export function createPapiRepository(network: Network): ChainRepository {
+  const client: PolkadotClient = createClient(getWsProvider(network.rpc))
+  const api = client.getTypedApi(numen)
+
+  /** The last nonce each address went out with, for sends fired back to back. */
+  const sentNonces = new Map<string, number>()
+
+  /** The node's EVM RPC, served over the same socket as everything else. */
+  const ethCall = (to: string, data: string, at: string) =>
+    client._request<string, [{ to: string; data: string }, string]>('eth_call', [{ to, data }, at])
+
+  /**
+   * What one argument of a call says. The runtime's own metadata has already
+   * turned the bytes into values, so this only has to write them down: an
+   * address is a string, an amount a bigint, a variant a name over its
+   * contents. A blob is the exception, since printing a runtime is no use to
+   * anybody and its hash is what an upgrade is checked against.
+   */
+  const spell = (value: unknown, depth = 0): string => {
+    if (value === undefined || value === null) return 'none'
+    if (typeof value === 'bigint') return value.toString()
+    if (typeof value === 'string') return value
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+
+    const bytes = asBytes(value)
+    if (bytes) {
+      if (bytes.length <= 32) return toHex(bytes)
+      return `${bytes.length.toLocaleString('en-US')} bytes, blake2 ${blake2AsHex(bytes, 256)}`
+    }
+
+    if (Array.isArray(value)) {
+      if (depth >= DEEP) return `${value.length} of them`
+      return value.map((entry) => spell(entry, depth + 1)).join(', ')
+    }
+
+    if (typeof value === 'object') {
+      const variant = value as { type?: unknown; value?: unknown }
+      if (typeof variant.type === 'string') {
+        const inner = 'value' in variant ? spell(variant.value, depth + 1) : 'none'
+        return inner === 'none' ? variant.type : `${variant.type} ${inner}`
+      }
+      if (depth >= DEEP) return '…'
+      return Object.entries(value)
+        .map(([name, held]) => `${name} ${spell(held, depth + 1)}`)
+        .join(', ')
+    }
+
+    return String(value)
+  }
+
+  /**
+   * The wallet's own reading of a call it did not build. Only the shapes it
+   * knows how to make come back as an operation, since those are the ones it
+   * can put into words. Everything else is shown by the name the runtime gives
+   * it, which is honest about how much has been understood.
+   */
+  const asOperation = (decoded: TxCallData): Operation | null => {
+    const call = asCall(decoded)
+
+    if (call.type === 'Balances' && call.value.type === 'transfer_keep_alive') {
+      const { dest, value } = call.value.value
+      return dest.type === 'Id' ? { kind: 'transfer', to: dest.value, amount: value } : null
+    }
+    if (call.type === 'Balances' && call.value.type === 'transfer_all') {
+      const { dest } = call.value.value
+      return dest.type === 'Id' ? { kind: 'transferAll', to: dest.value } : null
+    }
+    if (call.type === 'Utility' && call.value.type === 'batch_all') {
+      const inner = call.value.value.calls.map(asOperation)
+      return inner.every((entry) => entry !== null) ? { kind: 'batch', calls: inner } : null
+    }
+
+    return null
+  }
+
+  /**
+   * A proposal sits in the call itself while it is short enough, and in the
+   * preimage store once instalments push it past the inline bound. The lookup
+   * carries both halves of the storage key, so either one reads back here.
+   */
+  const proposalBytes = async (
+    proposal: ReferendumStatus['proposal'],
+  ): Promise<Uint8Array | undefined> => {
+    switch (proposal.type) {
+      case 'Inline':
+        return proposal.value
+      case 'Lookup':
+        return api.query.Preimage.PreimageFor.getValue(
+          [proposal.value.hash, proposal.value.len],
+          BEST,
+        )
+      case 'Legacy':
+        return undefined
+    }
+  }
+
+  /**
+   * What the treasury pays if the referendum passes. A batch is how one
+   * proposal books several payouts, so the walk goes down rather than reading
+   * the outermost call alone.
+   */
+  const collectSpends = (decoded: TxCallData, out: ProposalSpend[], depth: number): void => {
+    const call = asCall(decoded)
+    if (call.type === 'Utility') {
+      switch (call.value.type) {
+        case 'batch':
+        case 'batch_all':
+        case 'force_batch':
+          if (depth >= PROPOSAL_DEPTH) return
+          for (const nested of call.value.value.calls) collectSpends(nested, out, depth + 1)
+      }
+      return
+    }
+    if (call.type === 'Treasury' && call.value.type === 'spend') {
+      const { amount, beneficiary, valid_from } = call.value.value
+      out.push({ amount, beneficiary, validFrom: valid_from ?? null })
+    }
+  }
+
+  const readProposal = async (proposal: ReferendumStatus['proposal']): Promise<Proposal> => {
+    const bytes = await proposalBytes(proposal)
+    if (bytes == null) return { kind: 'other', label: 'a preimage the chain no longer holds' }
+
+    try {
+      const { decodedCall } = await api.txFromCallData(bytes)
+      const spends: ProposalSpend[] = []
+      collectSpends(decodedCall, spends, 0)
+      if (spends.length === 0) {
+        return { kind: 'other', label: `${decodedCall.type}.${decodedCall.value.type}` }
+      }
+      return { kind: 'spend', spends }
+    } catch {
+      return { kind: 'other', label: 'a call this build cannot read' }
+    }
+  }
+
+  /**
+   * How the referendum a vote sits on came out. Anything but approved or
+   * rejected holds nothing, so it all reads as void.
+   */
+  const pollOutcome = async (index: number): Promise<PollOutcome> => {
+    const info = await api.query.Referenda.ReferendumInfoFor.getValue(index, BEST)
+    switch (info?.type) {
+      case 'Ongoing':
+        return { kind: 'running' }
+      case 'Approved':
+        return { kind: 'ended', approved: true, at: info.value[0] }
+      case 'Rejected':
+        return { kind: 'ended', approved: false, at: info.value[0] }
+      default:
+        return { kind: 'void' }
+    }
+  }
+
+  /**
+   * The metadata names a preimage rather than holding the text, so what a
+   * referendum says about itself costs two more reads. Any step coming up empty
+   * means no metadata, which is the same answer as a referendum nobody wrote
+   * any for.
+   */
+  const readMetaOf = async (index: number): Promise<Metadata & { metadataHash: string | null }> => {
+    const hash = await api.query.Referenda.MetadataOf.getValue(index, BEST)
+    if (!hash) return { ...NO_METADATA, metadataHash: null }
+
+    const status = await api.query.Preimage.RequestStatusFor.getValue(hash, BEST)
+    const len = status?.type === 'Unrequested' ? status.value.len : status?.value.maybe_len
+    if (len === undefined) return { ...NO_METADATA, metadataHash: hash }
+
+    const bytes = await api.query.Preimage.PreimageFor.getValue([hash, len], BEST)
+    const meta = bytes ? readMeta(new TextDecoder().decode(bytes)) : NO_METADATA
+    return { ...meta, metadataHash: hash }
+  }
+
+  const readRegistration = async (address: string): Promise<Registration | null> => {
+    const entry = await api.query.Identity.IdentityOf.getValue(address, BEST)
+    if (!entry) return null
+
+    return {
+      info: toIdentityInfo(entry.info),
+      judgements: entry.judgements.map(([registrar, judgement]) =>
+        judgement.type === 'FeePaid'
+          ? { registrar, judgement: judgement.type, fee: judgement.value }
+          : { registrar, judgement: judgement.type },
+      ),
+      deposit: entry.deposit,
+    }
+  }
+
+  // The table never changes without a runtime upgrade, and a proposal needs it
+  let tracks: Promise<Track[]> | null = null
+  const trackTable = () => (tracks ??= api.constants.Referenda.Tracks().then((table) => table.map(toTrack)))
+
+  // Same story for the rest of the constants, so one read serves the session
+  let constants: Promise<ChainFacts> | null = null
+  const chainFacts = () => (constants ??= readFacts())
+
+  const readFacts = async (): Promise<ChainFacts> => {
+    const [
+      ss58Prefix,
+      existentialDeposit,
+      blockSeconds,
+      voteLockingPeriod,
+      undecidingTimeout,
+      submissionDeposit,
+      payoutPeriod,
+      proxyDepositBase,
+      proxyDepositFactor,
+      maxProxies,
+      identityBasicDeposit,
+      identityByteDeposit,
+      subAccountDeposit,
+      maxSuffixLength,
+      minVestedTransfer,
+      caps,
+      preimageBaseDeposit,
+      preimageByteDeposit,
+      balancesErc20,
+      evmChainId,
+      treasuryPalletId,
+      validatorStake,
+      validatorLockPeriod,
+      maxValidators,
+      sessionPeriod,
+      sessionOffset,
+    ] = await Promise.all([
+      api.constants.System.SS58Prefix(),
+      api.constants.Balances.ExistentialDeposit(),
+      api.constants.Difficulty.TargetBlockTime(),
+      api.constants.ConvictionVoting.VoteLockingPeriod(),
+      api.constants.Referenda.UndecidingTimeout(),
+      api.constants.Referenda.SubmissionDeposit(),
+      api.constants.Treasury.PayoutPeriod(),
+      api.constants.Proxy.ProxyDepositBase(),
+      api.constants.Proxy.ProxyDepositFactor(),
+      api.constants.Proxy.MaxProxies(),
+      api.constants.Identity.BasicDeposit(),
+      api.constants.Identity.ByteDeposit(),
+      api.constants.Identity.SubAccountDeposit(),
+      api.constants.Identity.MaxSuffixLength(),
+      api.constants.Vesting.MinVestedTransfer(),
+      api.constants.Origins.SpendCaps(),
+      api.constants.Origins.PreimageBaseDeposit(),
+      api.constants.Origins.PreimageByteDeposit(),
+      api.constants.Precompiles.BalancesErc20(),
+      api.query.EVMChainId.ChainId.getValue(),
+      api.constants.Treasury.PalletId(),
+      api.constants.Validator.LockAmount(),
+      api.constants.Validator.LockDuration(),
+      api.constants.Validator.MaxValidators(),
+      api.constants.Validator.SessionPeriod(),
+      api.constants.Validator.SessionOffset(),
+    ])
+
+    // Addresses and amounts are formatted long before anything is read from
+    // the chain, so those two are settings rather than answers. Checking them
+    // here turns a chain that disagrees into a refusal rather than into
+    // addresses nobody can use and amounts off by orders of magnitude.
+    const { tokenDecimals, tokenSymbol } = (await client.getChainSpecData()).properties as {
+      tokenDecimals?: number
+      tokenSymbol?: string
+    }
+    if (ss58Prefix !== SS58_PREFIX) {
+      throw new Error(`Chain uses address format ${ss58Prefix}, this wallet is built for ${SS58_PREFIX}`)
+    }
+    if (tokenDecimals !== DECIMALS) {
+      throw new Error(`Chain carries ${tokenDecimals} decimals, this wallet is built for ${DECIMALS}`)
+    }
+    if (!tokenSymbol) {
+      throw new Error('Chain names no token symbol in its spec')
+    }
+
+    return {
+      ss58Prefix,
+      decimals: tokenDecimals,
+      symbol: tokenSymbol,
+      evmChainId: Number(evmChainId),
+      balancesErc20,
+      existentialDeposit,
+      blockSeconds: Number(blockSeconds),
+      voteLockingPeriod,
+      undecidingTimeout,
+      submissionDeposit,
+      payoutPeriod,
+      preimageBaseDeposit,
+      preimageByteDeposit,
+      treasury: palletAccount(hexToU8a(treasuryPalletId)),
+      proxyDepositBase,
+      proxyDepositFactor,
+      maxProxies,
+      identityBasicDeposit,
+      identityByteDeposit,
+      subAccountDeposit,
+      maxSuffixLength,
+      minVestedTransfer,
+      spenders: caps.map(([track, , cap]) => ({ track, cap })),
+      validatorStake,
+      validatorLockPeriod,
+      maxValidators,
+      sessionPeriod,
+      sessionOffset,
+    }
+  }
+
+  const readKeysLayout = () =>
+    getTypedCodecs(numen).then(({ query }) => {
+      const codec = query.Session.NextKeys.value
+      // A short blob decodes without complaint, so the length is checked
+      // against what a full set of these fixed size keys encodes to
+      return { codec, size: codec.enc(codec.dec(new Uint8Array(1024))).length }
+    })
+  let keysLayout: ReturnType<typeof readKeysLayout> | null = null
+
+  const decodeKeys = async (hex: string) => {
+    const { codec, size } = await (keysLayout ??= readKeysLayout())
+    const blob = hex.trim()
+    if (!isHex(blob) || (blob.length - 2) / 2 !== size) {
+      throw new Error('Not the session keys this chain takes')
+    }
+    return codec.dec(hexToU8a(blob))
+  }
+
+  /**
+   * When the call being signed was first started, which every signature after
+   * the first has to name. Nobody upstream carries it, so nobody upstream can
+   * get it wrong, and a call nobody has started yet simply has none.
+   */
+  const timepointOf = async (multisig: string, callHash: string): Promise<Timepoint | undefined> =>
+    (await api.query.Multisig.Multisigs.getValue(multisig, callHash, BEST))?.when
+
+  const motionTx = (motion: Motion): Tx => {
+    switch (motion.kind) {
+      case 'spend': {
+        const spends = motion.payouts.map((payout) =>
+          api.tx.Treasury.spend({
+            amount: payout.amount,
+            beneficiary: payout.beneficiary,
+            valid_from: payout.validFrom ?? undefined,
+          }),
+        )
+        const [only] = spends
+        if (only == null) throw new Error('A proposal has to ask for something')
+        // One payout stands on its own, several have to run or fail together
+        return spends.length === 1
+          ? only
+          : api.tx.Utility.batch_all({ calls: spends.map((tx) => tx.decodedCall) })
+      }
+      case 'remark':
+        return api.tx.System.remark({ remark: encoder.encode(motion.text) })
+      case 'cancel':
+        return api.tx.Referenda.cancel({ index: motion.poll })
+      case 'kill':
+        return api.tx.Referenda.kill({ index: motion.poll })
+      case 'addRegistrar':
+        return api.tx.Identity.add_registrar({ account: Enum('Id', motion.account) })
+      case 'removeRegistrar':
+        return api.tx.Identity.remove_registrar({ index: motion.registrar })
+      case 'addUsernameAuthority':
+        return api.tx.Identity.add_username_authority({
+          authority: Enum('Id', motion.authority),
+          suffix: encoder.encode(motion.suffix),
+          allocation: motion.allocation,
+        })
+      case 'removeUsernameAuthority':
+        return api.tx.Identity.remove_username_authority({
+          suffix: encoder.encode(motion.suffix),
+          authority: Enum('Id', motion.authority),
+        })
+    }
+  }
+
+  const build = async (operation: Operation): Promise<Tx> => {
+    if (operation.kind === 'propose') {
+      const track = (await trackTable()).find((entry) => entry.id === operation.track)
+      if (!track) throw new Error(`Track ${operation.track} takes no proposals`)
+
+      // Referenda carries a short proposal in the call itself and leaves a
+      // longer one in the preimage store, which is where instalments land. A
+      // remark goes there whatever its length, since the dialog quotes its copy
+      // of the text as a second preimage
+      const encoded = await motionTx(operation.motion).getEncodedData()
+      const inline = operation.motion.kind !== 'remark' && encoded.length <= INLINE_BOUND
+      const proposal = inline
+        ? Enum('Inline', encoded)
+        : Enum('Lookup', { hash: blake2AsHex(encoded, 256), len: encoded.length })
+
+      const submit = api.tx.Referenda.submit({
+        proposal_origin: Enum('Origins', Enum(track.origin as CustomOrigin)),
+        proposal,
+        enactment_moment: Enum('After', track.minEnactmentPeriod),
+      })
+
+      // The title has to be a preimage of its own before set_metadata will take
+      // it, and set_metadata has to name an index the chain has not handed out
+      // yet. Batching all three means a racing proposal takes the index, ours
+      // fails on it, and the whole thing reverts rather than titling somebody
+      // else's referendum
+      const dump = new TextEncoder().encode(metadataDump(operation.title, operation.description))
+      const note = api.tx.Preimage.note_preimage({ bytes: dump })
+      const name = api.tx.Referenda.set_metadata({
+        index: await api.query.Referenda.ReferendumCount.getValue(BEST),
+        maybe_hash: blake2AsHex(dump, 256),
+      })
+
+      const calls = [note.decodedCall, submit.decodedCall, name.decodedCall]
+      if (!inline) calls.unshift(api.tx.Preimage.note_preimage({ bytes: encoded }).decodedCall)
+      return api.tx.Utility.batch_all({ calls })
+    }
+
+    if (operation.kind === 'editMetadata') {
+      const dump = new TextEncoder().encode(metadataDump(operation.title, operation.description))
+      const note = api.tx.Preimage.note_preimage({ bytes: dump })
+      const name = api.tx.Referenda.set_metadata({
+        index: operation.poll,
+        maybe_hash: blake2AsHex(dump, 256),
+      })
+      const calls = [note.decodedCall, name.decodedCall]
+      if (operation.clear) {
+        calls.push(api.tx.Preimage.unnote_preimage({ hash: operation.clear }).decodedCall)
+      }
+      return api.tx.Utility.batch_all({ calls })
+    }
+
+    if (operation.kind === 'batch') {
+      const inner = await Promise.all(operation.calls.map(build))
+      return api.tx.Utility.batch_all({ calls: inner.map((tx) => tx.decodedCall) })
+    }
+
+    if (operation.kind === 'asProxy') {
+      const inner = await build(operation.call)
+      return api.tx.Proxy.proxy({
+        real: Enum('Id', operation.real),
+        force_proxy_type: undefined,
+        call: inner.decodedCall,
+      })
+    }
+
+    if (operation.kind === 'multisigApprove') {
+      // Every signature carries the call, so the chain can run it the moment
+      // the last one lands, and it has to be told what running it may cost
+      const inner = await build(operation.call)
+      const encoded = await inner.getEncodedData()
+      const { weight } = await api.apis.TransactionPaymentCallApi.query_call_info(
+        asCall(inner.decodedCall),
+        encoded.length,
+      )
+
+      return api.tx.Multisig.as_multi({
+        threshold: operation.threshold,
+        other_signatories: operation.others,
+        maybe_timepoint: await timepointOf(operation.multisig, blake2AsHex(encoded, 256)),
+        call: inner.decodedCall,
+        max_weight: weight,
+      })
+    }
+
+    if (operation.kind === 'multisigApproveData') {
+      const inner = await api.txFromCallData(hexToU8a(operation.hex))
+      const encoded = await inner.getEncodedData()
+      const { weight } = await api.apis.TransactionPaymentCallApi.query_call_info(
+        asCall(inner.decodedCall),
+        encoded.length,
+      )
+
+      return api.tx.Multisig.as_multi({
+        threshold: operation.threshold,
+        other_signatories: operation.others,
+        maybe_timepoint: await timepointOf(operation.multisig, blake2AsHex(encoded, 256)),
+        call: inner.decodedCall,
+        max_weight: weight,
+      })
+    }
+
+    if (operation.kind === 'multisigCancel') {
+      const when = await timepointOf(operation.multisig, operation.callHash)
+      if (!when) throw new Error('That call is no longer waiting on signatures')
+
+      return api.tx.Multisig.cancel_as_multi({
+        threshold: operation.threshold,
+        other_signatories: operation.others,
+        timepoint: when,
+        call_hash: operation.callHash,
+      })
+    }
+
+    if (operation.kind === 'setKeys') {
+      return api.tx.Session.set_keys({
+        keys: await decodeKeys(operation.keys),
+        proof: hexToU8a(operation.proof),
+      })
+    }
+
+    if (operation.kind === 'provideJudgement') {
+      // The chain takes the hash of the identity a verdict is for and refuses
+      // the call if the identity has moved on since. Hashing what the registrar
+      // was shown is what makes that check worth anything, so the info comes in
+      // with the call rather than being read off the chain again here.
+      //
+      // Two bytes off the front of the call drops the pallet and call index,
+      // which leaves the encoded info the chain hashes.
+      const encoded = await api.tx.Identity.set_identity({
+        info: fromIdentityInfo(operation.info),
+      }).getEncodedData()
+
+      return api.tx.Identity.provide_judgement({
+        reg_index: operation.registrar,
+        target: Enum('Id', operation.target),
+        judgement: Enum(operation.judgement),
+        identity: blake2AsHex(encoded.slice(2), 256),
+      })
+    }
+
+    return sync(operation)
+  }
+
+  const sync = (
+    operation: Exclude<
+      Operation,
+      | { kind: 'propose' }
+      | { kind: 'editMetadata' }
+      | { kind: 'provideJudgement' }
+      | { kind: 'setKeys' }
+      | { kind: 'multisigApprove' }
+      | { kind: 'multisigApproveData' }
+      | { kind: 'multisigCancel' }
+      | { kind: 'asProxy' }
+      | { kind: 'batch' }
+    >,
+  ): Tx => {
+    switch (operation.kind) {
+      case 'transfer':
+        return api.tx.Balances.transfer_keep_alive({
+          dest: Enum('Id', operation.to),
+          value: operation.amount,
+        })
+      case 'transferAll':
+        return api.tx.Balances.transfer_all({
+          dest: Enum('Id', operation.to),
+          keep_alive: false,
+        })
+      case 'delegate':
+        return api.tx.ConvictionVoting.delegate({
+          class: operation.delegation.track,
+          to: Enum('Id', operation.delegation.to),
+          conviction: Enum(operation.delegation.conviction),
+          balance: operation.delegation.amount,
+        })
+      case 'undelegate':
+        return api.tx.ConvictionVoting.undelegate({ class: operation.track })
+      // A delay would make the proxy announce before it acts. Nobody asks for
+      // one from a wallet, so this always sets it up without
+      case 'addProxy':
+        return api.tx.Proxy.add_proxy({
+          delegate: Enum('Id', operation.proxy.delegate),
+          proxy_type: Enum(operation.proxy.type),
+          delay: 0,
+        })
+      case 'removeProxy':
+        return api.tx.Proxy.remove_proxy({
+          delegate: Enum('Id', operation.proxy.delegate),
+          proxy_type: Enum(operation.proxy.type),
+          delay: 0,
+        })
+      case 'registerIdentity': {
+        const set = api.tx.Identity.set_identity({ info: fromIdentityInfo(operation.info) })
+        const calls = [set]
+        // The pallet's own fee rail. The chain reserves the registrar's
+        // declared fee here and hands it over with the judgement
+        if (operation.registrar) {
+          calls.push(
+            api.tx.Identity.request_judgement({
+              reg_index: operation.registrar.index,
+              max_fee: operation.registrar.maxFee,
+            }),
+          )
+        }
+        // batch_all lands all or none, so the payment and the record it pays
+        // for cannot come apart, and the judge only counts a transfer riding
+        // the extrinsic that set the identity. A rewrite owing nothing rides
+        // no transfer at all
+        if (operation.pay && operation.pay.amount > 0n) {
+          calls.push(
+            api.tx.Balances.transfer_keep_alive({
+              dest: Enum('Id', operation.pay.to),
+              value: operation.pay.amount,
+            }),
+          )
+        }
+        return calls.length === 1
+          ? set
+          : api.tx.Utility.batch_all({ calls: calls.map((call) => call.decodedCall) })
+      }
+      case 'clearIdentity':
+        return api.tx.Identity.clear_identity()
+      case 'setSubs':
+        return api.tx.Identity.set_subs({
+          subs: operation.subs.map((sub) => [sub.address, toData(sub.name)]),
+        })
+      case 'quitSub':
+        return api.tx.Identity.quit_sub()
+      case 'vest':
+        return api.tx.Vesting.vest()
+      case 'vestOther':
+        return api.tx.Vesting.vest_other({ target: Enum('Id', operation.target) })
+      case 'vestedTransfer':
+        return api.tx.Vesting.vested_transfer({
+          target: Enum('Id', operation.to),
+          schedule: {
+            locked: operation.schedule.locked,
+            per_block: operation.schedule.perBlock,
+            starting_block: operation.schedule.startingBlock,
+          },
+        })
+      case 'proposeBounty':
+        return api.tx.Bounties.propose_bounty({
+          value: operation.value,
+          description: new TextEncoder().encode(operation.description),
+        })
+      case 'acceptCurator':
+        return api.tx.Bounties.accept_curator({ bounty_id: operation.bounty })
+      case 'awardBounty':
+        return api.tx.Bounties.award_bounty({
+          bounty_id: operation.bounty,
+          beneficiary: Enum('Id', operation.beneficiary),
+        })
+      case 'claimBounty':
+        return api.tx.Bounties.claim_bounty({ bounty_id: operation.bounty })
+      case 'unassignCurator':
+        return api.tx.Bounties.unassign_curator({ bounty_id: operation.bounty })
+      case 'extendBounty':
+        return api.tx.Bounties.extend_bounty_expiry({
+          bounty_id: operation.bounty,
+          remark: new Uint8Array(),
+        })
+      case 'addChild':
+        return api.tx.ChildBounties.add_child_bounty({
+          parent_bounty_id: operation.bounty,
+          value: operation.value,
+          description: new TextEncoder().encode(operation.description),
+        })
+      case 'proposeChildCurator':
+        return api.tx.ChildBounties.propose_curator({
+          parent_bounty_id: operation.bounty,
+          child_bounty_id: operation.child,
+          curator: Enum('Id', operation.curator),
+          fee: operation.fee,
+        })
+      case 'acceptChildCurator':
+        return api.tx.ChildBounties.accept_curator({
+          parent_bounty_id: operation.bounty,
+          child_bounty_id: operation.child,
+        })
+      case 'awardChild':
+        return api.tx.ChildBounties.award_child_bounty({
+          parent_bounty_id: operation.bounty,
+          child_bounty_id: operation.child,
+          beneficiary: Enum('Id', operation.beneficiary),
+        })
+      case 'claimChild':
+        return api.tx.ChildBounties.claim_child_bounty({
+          parent_bounty_id: operation.bounty,
+          child_bounty_id: operation.child,
+        })
+      case 'unassignChildCurator':
+        return api.tx.ChildBounties.unassign_curator({
+          parent_bounty_id: operation.bounty,
+          child_bounty_id: operation.child,
+        })
+      case 'closeChild':
+        return api.tx.ChildBounties.close_child_bounty({
+          parent_bounty_id: operation.bounty,
+          child_bounty_id: operation.child,
+        })
+      case 'requestJudgement':
+        return api.tx.Identity.request_judgement({
+          reg_index: operation.registrar,
+          max_fee: operation.maxFee,
+        })
+      case 'cancelJudgement':
+        return api.tx.Identity.cancel_request({ reg_index: operation.registrar })
+      case 'setFee':
+        return api.tx.Identity.set_fee({ index: operation.registrar, fee: operation.fee })
+      case 'lockStake':
+        return api.tx.Validator.lock()
+      case 'requestExit':
+        return api.tx.Validator.request_exit()
+      case 'vote':
+        return api.tx.ConvictionVoting.vote({
+          poll_index: operation.poll,
+          vote:
+            operation.ballot.kind === 'abstain'
+              ? Enum('SplitAbstain', { aye: 0n, nay: 0n, abstain: operation.ballot.amount })
+              : Enum('Standard', {
+                  vote: voteByte(operation.ballot),
+                  balance: operation.ballot.amount,
+                }),
+        })
+      case 'removeVote':
+        return api.tx.ConvictionVoting.remove_vote({
+          class: operation.track,
+          index: operation.poll,
+        })
+      case 'removeOtherVote':
+        return api.tx.ConvictionVoting.remove_other_vote({
+          target: Enum('Id', operation.target),
+          class: operation.track,
+          index: operation.poll,
+        })
+      case 'unlock':
+        return api.tx.ConvictionVoting.unlock({
+          class: operation.track,
+          target: Enum('Id', operation.target),
+        })
+      case 'decisionDeposit':
+        return api.tx.Referenda.place_decision_deposit({ index: operation.poll })
+      case 'payout':
+        return api.tx.Treasury.payout({ index: operation.spend })
+      case 'refundSubmission':
+        return api.tx.Referenda.refund_submission_deposit({ index: operation.poll })
+      case 'refundDecision':
+        return api.tx.Referenda.refund_decision_deposit({ index: operation.poll })
+      case 'unnotePreimage':
+        return api.tx.Preimage.unnote_preimage({ hash: operation.hash })
+    }
+  }
+
+  // Asked at connect so a chain that disagrees refuses up front rather than
+  // on whichever screen happens to read a constant first
+  chainFacts().catch(() => {})
+
+  return {
+    facts(): Promise<ChainFacts> {
+      return chainFacts()
+    },
+
+    /**
+     * One request timed end to end. system_health is asked for because it is
+     * never served from a cache and brings back what the node makes of its own
+     * position, which no round trip on its own would say.
+     */
+    async reach(): Promise<Reach> {
+      const ask = async () => {
+        const at = performance.now()
+        const health = await client._request<Health, []>('system_health', [])
+        return { ms: performance.now() - at, health }
+      }
+
+      // Twice, keeping the shorter. A reply that lands behind whatever the page
+      // was busy with is timed from the queue rather than the wire, and one
+      // stalled render reads as a node an order of magnitude slower than it is
+      const first = await ask()
+      const second = await ask()
+      const { health } = second
+
+      return {
+        ms: Math.min(first.ms, second.ms),
+        peers: health.peers,
+        syncing: health.isSyncing,
+      }
+    },
+
+    subscribeHead(onHead: (head: ChainHead) => void): Unsubscribe {
+      const sub = client.finalizedBlock$.subscribe((block) => {
+        onHead({ number: block.number, hash: block.hash })
+      })
+      return () => sub.unsubscribe()
+    },
+
+    /**
+     * Two storage items make one balance. The account carries the amounts and
+     * the lock list carries what froze them, and either changes without the
+     * other, so both are watched. Nothing goes out until both have spoken, or
+     * the first reading would show the account with no locks on it.
+     */
+    subscribeBalance(address, onBalance): Unsubscribe {
+      let info: AccountInfo | undefined
+      // The deposit decides what stays untouchable, so nothing can be reported
+      // before it lands. It arrives once and every later update reuses it.
+      let deposit: bigint | undefined
+
+      const push = () => {
+        if (info && deposit !== undefined) onBalance(toBalance(info, deposit))
+      }
+
+      void chainFacts().then((facts) => {
+        deposit = facts.existentialDeposit
+        push()
+      })
+
+      const account = api.query.System.Account.watchValue(address).subscribe((update) => {
+        info = update.value
+        push()
+      })
+      return () => account.unsubscribe()
+    },
+
+    async proxies(address: string): Promise<Proxy[]> {
+      const [definitions] = await api.query.Proxy.Proxies.getValue(address)
+      return definitions.map((definition) => ({
+        delegate: definition.delegate,
+        type: definition.proxy_type.type,
+      }))
+    },
+
+    /**
+     * The pallet keeps the list on the parent and each name on the sub, so what
+     * the parent is holding takes one read and the names take one apiece.
+     */
+    async subsOf(address: string): Promise<Subs> {
+      const [deposit, addresses] = await api.query.Identity.SubsOf.getValue(address, BEST)
+      const list = await Promise.all(
+        addresses.map(async (sub) => {
+          const link = await api.query.Identity.SuperOf.getValue(sub, BEST)
+          return { address: sub, name: link ? fromData(link[1]) : '' }
+        }),
+      )
+      return { deposit, list }
+    },
+
+    /**
+     * The description is stored apart from the record, so naming a bounty is a
+     * read of its own. What the status carries depends on which one it is.
+     */
+    async bounties(): Promise<Bounty[]> {
+      const entries = await api.query.Bounties.Bounties.getEntries(BEST)
+
+      const read = entries.map(({ keyArgs: [index], value }) => ({
+        index,
+        value,
+        state: BOUNTY_STATES[value.status.type],
+      }))
+
+      return (
+        await Promise.all(
+          read.map(async ({ index, value, state }) => {
+            const bytes = await api.query.Bounties.BountyDescriptions.getValue(index, BEST)
+            return {
+              index,
+              description: bytes ? new TextDecoder().decode(bytes) : '',
+              proposer: value.proposer,
+              value: value.value,
+              fee: value.fee,
+              bond: value.bond,
+              curatorDeposit: value.curator_deposit,
+              state,
+              ...bountyHolders(value.status),
+            }
+          }),
+        )
+      ).sort((one, other) => other.index - one.index)
+    },
+
+    /** Keyed by the parent and the child together, which is the only name one has. */
+    async childBounties(): Promise<ChildBounty[]> {
+      const entries = await api.query.ChildBounties.ChildBounties.getEntries(BEST)
+
+      const read = entries.map(({ keyArgs: [parent, index], value }) => ({
+        parent,
+        index,
+        value,
+        state: CHILD_STATES[value.status.type],
+      }))
+
+      return (
+        await Promise.all(
+          read.map(async ({ parent, index, value, state }) => {
+            const bytes = await api.query.ChildBounties.ChildBountyDescriptionsV1.getValue(
+              parent,
+              index,
+              BEST,
+            )
+            return {
+              parent,
+              index,
+              description: bytes ? new TextDecoder().decode(bytes) : '',
+              value: value.value,
+              fee: value.fee,
+              curatorDeposit: value.curator_deposit,
+              state,
+              ...childHolders(value.status),
+            }
+          }),
+        )
+      ).sort((one, other) => other.index - one.index)
+    },
+
+    async vesting(address: string): Promise<Vesting> {
+      const [schedules, locks] = await Promise.all([
+        api.query.Vesting.Vesting.getValue(address, BEST),
+        api.query.Balances.Locks.getValue(address, BEST),
+      ])
+      return {
+        schedules: (schedules ?? []).map((schedule) => ({
+          locked: schedule.locked,
+          perBlock: schedule.per_block,
+          startingBlock: schedule.starting_block,
+        })),
+        lock: locks.find((lock) => lock.id === VESTING_LOCK)?.amount ?? 0n,
+      }
+    },
+
+    async standingOf(address: string): Promise<Standing> {
+      // The runtime's gate reads the account's own record first and the parent's
+      // after, so both are wanted whether or not the first one turns up
+      const [own, link] = await Promise.all([
+        readRegistration(address),
+        api.query.Identity.SuperOf.getValue(address, BEST),
+      ])
+      if (!link) return { own, sub: null }
+
+      const [parent, name] = link
+      return {
+        own,
+        sub: { name: fromData(name), parent, registration: await readRegistration(parent) },
+      }
+    },
+
+    async registrars(): Promise<Registrar[]> {
+      const entries = await api.query.Identity.Registrars.getValue(BEST)
+      // The list is sparse once one is removed, and the index is what a request
+      // names, so a gap keeps its slot rather than shifting the ones after it
+      return entries.flatMap((entry, index) =>
+        entry ? [{ index, account: entry.account, fee: entry.fee }] : [],
+      )
+    },
+
+    async usernameAuthorities(): Promise<UsernameAuthority[]> {
+      const entries = await api.query.Identity.AuthorityOf.getEntries(BEST)
+      return entries
+        .map(({ keyArgs: [suffix], value }) => ({
+          suffix: decoder.decode(suffix),
+          account: value.account_id,
+          allocation: value.allocation,
+        }))
+        .sort((one, other) => one.suffix.localeCompare(other.suffix))
+    },
+
+    tracks: trackTable,
+
+    /**
+     * The running ones. A settled referendum is history, which the explorer
+     * keeps. What order they come back in is the list's business.
+     */
+    async referenda(): Promise<Referendum[]> {
+      const entries = await api.query.Referenda.ReferendumInfoFor.getEntries(BEST)
+
+      const running = entries.flatMap(({ keyArgs: [index], value }) =>
+        value.type === 'Ongoing' ? [{ index, status: value.value }] : [],
+      )
+
+      const read = running.map(async ({ index, status }) => ({
+        index,
+        track: status.track,
+        ...(await readMetaOf(index)),
+        submitter: status.submission_deposit.who,
+        state: toState(status),
+        tally: status.tally,
+        proposal: await readProposal(status.proposal),
+        decisionDeposit: status.decision_deposit?.amount ?? null,
+        submitted: status.submitted,
+        deciding: status.deciding
+          ? { since: status.deciding.since, confirming: status.deciding.confirming ?? null }
+          : null,
+      }))
+
+      return Promise.all(read)
+    },
+
+    /**
+     * The ones that are over and have not given their deposits back. A refunded
+     * deposit is taken out of the record, so what is left here is what is owed.
+     */
+    async settled(): Promise<Settled[]> {
+      const entries = await api.query.Referenda.ReferendumInfoFor.getEntries(BEST)
+
+      return entries
+        .flatMap(({ keyArgs: [index], value }) => {
+          switch (value.type) {
+            case 'Approved':
+            case 'Rejected':
+            case 'TimedOut':
+            case 'Cancelled': {
+              const [, submission, decision] = value.value
+              const outcome = OUTCOMES[value.type]
+              return [
+                { index, outcome, submission: submission ?? null, decision: decision ?? null },
+              ]
+            }
+            case 'Ongoing':
+            case 'Killed':
+              return []
+          }
+        })
+        .filter(hasRefund)
+        .sort((one, other) => other.index - one.index)
+    },
+
+    /**
+     * What each of these multisigs has started and not finished. The pallet
+     * keys them by the multisig and the hash of the call, so the pair is the
+     * only name a waiting call has.
+     */
+    async pending(multisigs: string[]): Promise<Pending[]> {
+      if (multisigs.length === 0) return []
+      const wanted = new Set(multisigs)
+      const entries = await api.query.Multisig.Multisigs.getEntries(BEST)
+
+      return entries.flatMap(({ keyArgs: [multisig, callHash], value }) =>
+        wanted.has(multisig)
+          ? [{
+              multisig,
+              callHash,
+              when: value.when,
+              deposit: value.deposit,
+              depositor: value.depositor,
+              approvals: value.approvals,
+            }]
+          : [],
+      )
+    },
+
+    /**
+     * What a multisig signatory hands the next one. The chain keeps only the
+     * hash, so these bytes are the only copy of what was started.
+     */
+    async callData(operation: Operation) {
+      const tx = await build(operation)
+      const encoded = await tx.getEncodedData()
+      return {
+        name: `${tx.decodedCall.type}.${tx.decodedCall.value.type}`,
+        args: Object.entries(tx.decodedCall.value.value ?? {}).map(([name, value]) => ({
+          name,
+          value: spell(value),
+        })),
+        hex: toHex(encoded),
+        hash: blake2AsHex(encoded, 256),
+      }
+    },
+
+    /**
+     * The other end of that. The hash comes off the call as the runtime encodes
+     * it rather than off the bytes handed in, so what the reader is shown and
+     * what the hash names are the same call.
+     */
+    async readCall(hex: string): Promise<ReadCall> {
+      if (!/^0x[0-9a-fA-F]*$/.test(hex.trim()) || hex.trim().length % 2 !== 0) {
+        throw new Error('Call data is a 0x hex string')
+      }
+
+      const read = await api.txFromCallData(hexToU8a(hex.trim()))
+      const args = read.decodedCall.value.value ?? {}
+      return {
+        hash: blake2AsHex(await read.getEncodedData(), 256),
+        operation: asOperation(read.decodedCall),
+        label: `${read.decodedCall.type}.${read.decodedCall.value.type}`,
+        args: Object.entries(args).map(([name, value]) => ({ name, value: spell(value) })),
+      }
+    },
+
+    /**
+     * Only the account that noted a preimage may clear it, so anything nobody
+     * here owns is somebody else's to deal with. A requested one is held by the
+     * chain rather than by its noter and cannot be cleared at all.
+     */
+    async preimages(owners: string[]): Promise<NotedPreimage[]> {
+      if (owners.length === 0) return []
+      const wanted = new Set(owners)
+      const entries = await api.query.Preimage.RequestStatusFor.getEntries(BEST)
+
+      return entries.flatMap(({ keyArgs: [hash], value }) => {
+        if (value.type !== 'Unrequested') return []
+        const [who, amount] = value.value.ticket
+        return wanted.has(who) ? [{ hash, who, len: value.value.len, amount }] : []
+      })
+    },
+
+    /**
+     * Everything the treasury still owes. A spend it has already paid out stays
+     * until somebody clears the record, and that record is what says it worked.
+     */
+    async spends(): Promise<Spend[]> {
+      const entries = await api.query.Treasury.Spends.getEntries(BEST)
+
+      return entries
+        .map(({ keyArgs: [index], value }) => ({
+          index,
+          amount: value.amount,
+          beneficiary: value.beneficiary,
+          validFrom: value.valid_from,
+          expireAt: value.expire_at,
+          paid: value.status.type === 'Attempted',
+        }))
+        .sort((one, other) => other.index - one.index)
+    },
+
+    async locks(address: string): Promise<ClassLock[]> {
+      const classes = await api.query.ConvictionVoting.ClassLocksFor.getValue(address, BEST)
+
+      return Promise.all(
+        classes.map(async ([track, amount]) => {
+          const voting = await api.query.ConvictionVoting.VotingFor.getValue(address, track, BEST)
+          const [until, carried] = voting.value.prior
+          const cast = voting.type === 'Casting' ? voting.value.votes : []
+          const votes = await Promise.all(
+            cast.map(async ([poll, vote]) => ({
+              poll,
+              ...toCast(vote),
+              outcome: await pollOutcome(poll),
+            })),
+          )
+          return { track, amount, votes, prior: { until, amount: carried } }
+        }),
+      )
+    },
+
+    async votingFor(address: string): Promise<TrackVoting[]> {
+      const entries = await api.query.ConvictionVoting.VotingFor.getEntries(address, BEST)
+
+      const read = await Promise.all(
+        entries.map(async ({ keyArgs: [, track], value }): Promise<TrackVoting | null> => {
+          if (value.type === 'Delegating') {
+            const { target, conviction, balance } = value.value
+            return {
+              track,
+              kind: 'delegating',
+              delegation: { track, to: target, conviction: conviction.type, amount: balance },
+            }
+          }
+          const polls = value.value.votes.map(([poll]) => poll)
+          if (polls.length === 0) return null
+          const running = await Promise.all(
+            polls.map(async (poll) => (await pollOutcome(poll)).kind === 'running'),
+          )
+          return {
+            track,
+            kind: 'voting',
+            ongoing: polls.filter((_, at) => running[at]),
+            ended: polls.filter((_, at) => !running[at]),
+          }
+        }),
+      )
+      return read.filter((entry) => entry !== null)
+    },
+
+    async activeIssuance(): Promise<bigint> {
+      const [total, inactive] = await Promise.all([
+        api.query.Balances.TotalIssuance.getValue(BEST),
+        api.query.Balances.InactiveIssuance.getValue(BEST),
+      ])
+      return total - inactive
+    },
+
+    async validators(): Promise<ValidatorSet> {
+      const [sitting, elected, queued] = await Promise.all([
+        api.query.Session.Validators.getValue(BEST),
+        api.query.Validator.DesiredValidators.getValue(BEST),
+        api.query.Validator.PendingValidators.getValue(BEST),
+      ])
+      return { sitting, elected, queued }
+    },
+
+    async validatorOf(address: string): Promise<ValidatorRecord> {
+      const [lock, exempt, cooldown, keys, sitting, session] = await Promise.all([
+        api.query.Validator.ValidatorLocks.getValue(address, BEST),
+        api.query.Validator.StakeExemptAccounts.getValue(address, BEST),
+        api.query.Validator.RejoinCooldown.getValue(address, BEST),
+        api.query.Session.NextKeys.getValue(address, BEST),
+        api.query.Session.Validators.getValue(BEST),
+        api.query.Session.CurrentIndex.getValue(BEST),
+      ])
+      // im_online numbers heartbeats by the voter's place in this session's set
+      const seat = sitting.indexOf(address)
+      const heartbeat =
+        seat < 0
+          ? null
+          : (await api.query.ImOnline.ReceivedHeartbeats.getValue(session, seat, BEST)) === true
+
+      return {
+        lock: lock
+          ? {
+              amount: lock.amount,
+              since: lock.lock_block,
+              until: lock.expiry_block,
+              status: lock.status.type,
+            }
+          : null,
+        // The entry holds a unit, which reads back as null, and a missing one as undefined
+        exempt: exempt !== undefined,
+        cooldown: cooldown ?? null,
+        keys: keys ? { grandpa: keys.grandpa, imOnline: keys.im_online } : null,
+        heartbeat,
+      }
+    },
+
+    async readKeys(hex: string): Promise<SessionKeys> {
+      const keys = await decodeKeys(hex)
+      return { grandpa: keys.grandpa, imOnline: keys.im_online }
+    },
+
+    async tokens(): Promise<Token[]> {
+      const { evmChainId } = await chainFacts()
+      return Promise.all(
+        (TOKENS[evmChainId] ?? []).map(async ({ address, icon }) => {
+          const [name, symbol, decimals] = await Promise.all([
+            ethCall(address, NAME_CALL, 'latest'),
+            ethCall(address, SYMBOL_CALL, 'latest'),
+            ethCall(address, DECIMALS_CALL, 'latest'),
+          ])
+          return { ...readToken(address, { name, symbol, decimals }), icon }
+        }),
+      )
+    },
+
+    /**
+     * Read at each finalized block, so the figure keeps pace with the native
+     * balance beside it. A block the node cannot answer for is skipped, and the
+     * next one asks again.
+     */
+    subscribeTokenBalance(token, holder, onBalance): Unsubscribe {
+      let last: bigint | undefined
+      const sub = client.finalizedBlock$.subscribe((block) => {
+        ethCall(token, balanceOfCall(holder), `0x${block.number.toString(16)}`)
+          .then(readBalance)
+          .then((balance) => {
+            if (balance === last) return
+            last = balance
+            onBalance(balance)
+          })
+          .catch(() => {})
+      })
+      return () => sub.unsubscribe()
+    },
+
+    async estimateFee(from: string, operation: Operation): Promise<bigint> {
+      return (await build(operation)).getEstimatedFees(getFakeTxCreator(from))
+    },
+
+    async split(groups: Operation[][]): Promise<Operation[][]> {
+      const { base_extrinsic: base, max_extrinsic: most } = (
+        await api.constants.System.BlockWeights()
+      ).per_class.normal
+      if (!most) throw new Error('This runtime sets no weight limit for a transaction')
+
+      // Asked of the chain whole, since a batch weighs more than its calls
+      const fits = async (part: Operation[]) => {
+        const tx = await build(batched(part))
+        const encoded = await tx.getEncodedData()
+        const { weight } = await api.apis.TransactionPaymentCallApi.query_call_info(
+          asCall(tx.decodedCall),
+          encoded.length,
+        )
+        return (
+          base.ref_time + weight.ref_time <= most.ref_time &&
+          base.proof_size + weight.proof_size <= most.proof_size
+        )
+      }
+
+      return (await packed(groups, (part) => fits(part.flat()))).map((part) => part.flat())
+    },
+
+    submit(
+      account: WalletAccount,
+      operation: Operation,
+      onProgress?: (progress: TxProgress) => void,
+    ): Promise<string> {
+      return new Promise((resolve, reject) => {
+        // Left to itself PAPI reads the nonce out of block state, which cannot
+        // see the pool, so a second send while one is pending would go out
+        // stale. The node counts its pool, the map covers a send still on its
+        // way there, and a refusal drops the memory so a nonce that never
+        // landed cannot wedge the ones after it.
+        const fail = (problem: unknown) => {
+          sentNonces.delete(account.address)
+          reject(problem)
+        }
+        Promise.all([
+          build(operation),
+          client._request<number, [string]>('system_accountNextIndex', [account.address]),
+        ])
+          .then(([tx, fromNode]) => {
+            const nonce = Math.max(fromNode, (sentNonces.get(account.address) ?? -1) + 1)
+            sentNonces.set(account.address, nonce)
+            return tx.createSubmitAndWatch(account.signer, { nonce }).subscribe({
+              next(event) {
+                if (event.type === 'created') onProgress?.({ stage: 'signed', hash: event.txHash })
+                if (event.type === 'broadcasted') {
+                  onProgress?.({ stage: 'broadcast', hash: event.txHash })
+                }
+                if (event.type === 'inBestBlock') {
+                  if (!event.ok) return fail(new Error(dispatchMessage(event.dispatchError)))
+                  onProgress?.({ stage: 'inBlock', hash: event.txHash })
+                }
+                if (event.type === 'finalized') {
+                  if (!event.ok) return fail(new Error(dispatchMessage(event.dispatchError)))
+                  onProgress?.({ stage: 'finalized', hash: event.txHash })
+                  resolve(event.txHash)
+                }
+              },
+              error: (problem: unknown) => fail(refused(problem)),
+              complete: () => undefined,
+            })
+          })
+          .catch(fail)
+      })
+    },
+
+    disconnect() {
+      client.destroy()
+    },
+  }
+}

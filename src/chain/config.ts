@@ -1,0 +1,112 @@
+/**
+ * What the wallet has to know before it has asked the chain anything, plus the
+ * endpoints it can ask. Every runtime constant is read through
+ * `ChainRepository.facts()` instead, so nothing here restates one.
+ */
+
+import wtmr from '@/assets/tokens/wtmr.svg'
+
+export const SS58_PREFIX = 14240
+
+/** Balances carry 18 decimals to stay EVM native, so every amount is a bigint. */
+export const DECIMALS = 18
+
+export const UNIT = 10n ** BigInt(DECIMALS)
+
+/**
+ * What one checked sign in costs, mirrored from the judge's CHANNEL_FEE_NUMN in
+ * registrar-id. It rides the identity as a transfer to the treasury, and the
+ * judge leaves a record that paid less alone, so a price change lands there and
+ * here together.
+ */
+export const IDENTITY_CHECK_FEE = 10n * UNIT
+
+/**
+ * ERC20 contracts the wallet shows, keyed by the EVM chain id they live on.
+ * The chain keeps no token list or logos, so this one names each contract and
+ * its logo. Name, symbol and decimals come from each contract.
+ */
+export const TOKENS: Record<number, { address: string; icon: string }[]> = {
+  32026: [{ address: '0xa1795b3c6f74866c7def1df390f9e2e403dca2e9', icon: wtmr }],
+}
+
+export type NetworkId = 'mainnet' | 'testnet' | 'local'
+
+export interface Network {
+  /** One of NetworkId for the three that ship, or custom-<url> for the rest. */
+  id: string
+  name: string
+  rpc: string
+  /** Where an account's history lives. The wallet links, it does not index. */
+  explorer: string
+  /** Where a registrar proves the social channels an identity claims. */
+  identitySite: string
+  /** The automated registrar's account on this chain. */
+  registrar: string
+}
+
+export const NETWORKS: Record<NetworkId, Network> = {
+  mainnet: {
+    id: 'mainnet',
+    name: 'Numen',
+    rpc: 'wss://rpc.numen-network.org',
+    explorer: 'https://explorer.numen-network.org',
+    identitySite: 'https://id.numen-network.org',
+    registrar: 'nu7iBot1ZuaFNt6wh4CQ8B8yh82Q6PsgJF7N7gfCGnoLLxZwv',
+  },
+  testnet: {
+    id: 'testnet',
+    name: 'Numen Testnet',
+    rpc: 'wss://testnet.rpc.numen-network.org',
+    explorer: 'https://testnet.explorer.numen-network.org',
+    identitySite: 'https://testnet.id.numen-network.org',
+    registrar: 'nu7iBot1ZuaFNt6wh4CQ8B8yh82Q6PsgJF7N7gfCGnoLLxZwv',
+  },
+  local: {
+    id: 'local',
+    name: 'Numen Local',
+    rpc: 'ws://127.0.0.1:9944',
+    explorer: 'http://127.0.0.1:3000',
+    identitySite: 'https://testnet.id.numen-network.org',
+    registrar: 'nu7SVAyQhPoGBJfFg7di66oYTV2KVBBeCw3Gt9qTRE2zpSUyb',
+  },
+}
+
+/**
+ * Each deployment host serves one chain, so the address the wallet was loaded
+ * from picks the network it opens on. Matching is exact. Anything else is
+ * somebody running the wallet themselves, and their node is on their machine.
+ */
+const HOSTS: Record<string, NetworkId> = {
+  'wallet.numen-network.org': 'mainnet',
+  'testnet.wallet.numen-network.org': 'testnet',
+}
+
+export function defaultNetwork(): NetworkId {
+  return HOSTS[location.hostname] ?? (['localhost', '127.0.0.1'].includes(location.hostname) && !('Capacitor' in window) ? 'local' : 'mainnet')
+}
+
+/** The page the explorer serves for one account, history and all. */
+export function explorerAccount(network: Network, address: string): string {
+  return `${network.explorer}/account/${address}`
+}
+
+/** One submitted call, which is all the wallet has to point at after it lands. */
+export function explorerExtrinsic(network: Network, hash: string): string {
+  return `${network.explorer}/extrinsic/${hash}`
+}
+
+/** A token's holders and transfers, which the wallet does not index. */
+export function explorerToken(network: Network, address: string): string {
+  return `${network.explorer}/token/${address}`
+}
+
+/** Where a referendum is kept once the wallet stops carrying it, and while it runs. */
+export function explorerReferendum(network: Network, index: number): string {
+  return `${network.explorer}/referendum/${index}`
+}
+
+/** Every referendum there has ever been, which the wallet does not hold. */
+export function explorerGovernance(network: Network): string {
+  return `${network.explorer}/governance`
+}

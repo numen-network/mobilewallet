@@ -1,0 +1,14 @@
+{
+  "appId": "org.numen.network.wallet",
+  "appName": "Numen Wallet",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https",
+    "iosScheme": "capacitor"
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}

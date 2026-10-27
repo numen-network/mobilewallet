@@ -1,0 +1,262 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import './shadcn.css';
+@plugin '@tailwindcss/typography';
+
+/*
+  Test files name classes to prove which of two wins. A scanner that reads them
+  ships utilities no page ever renders.
+*/
+@source not "./**/*.test.ts";
+@source not "./**/*.test.tsx";
+
+/*
+  Generated components ship dark variants of their own, and the default one
+  follows the operating system. Bound to a class the wallet never sets, they
+  stay inert and the palette below stays the only one.
+*/
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+  One palette and one typeface, both taken from the explorer so the two read as
+  one product. There is no dark variant on purpose, a wallet that repaints
+  itself with the operating system is a wallet whose screenshots never match
+  what the user reports.
+*/
+
+/* Latin only, the same subset the explorer ships. Self hosted because the CSP
+   allows no remote font. */
+@font-face {
+  font-family: 'Inter Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('@fontsource-variable/inter/files/inter-latin-wght-normal.woff2')
+    format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root {
+  color-scheme: light;
+
+  --sans: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+  --ground: #f4f5f8;
+  --panel: #ffffff;
+  --recess: #f9fafb;
+  --hover: #f4f5f8;
+  --ink: #1a1c22;
+  /*
+    Both of these were under the 4.5 contrast that text this size wants. Measured
+    against the panel, lead was 3.86 and dim was 2.18. They now clear it on the
+    recessed input background too, which is the darker of the two grounds.
+  */
+  --lead: #5b6270;
+  --dim: #6b7280;
+  /*
+    Placeholders alone stay light. They are not text somebody has to read, they
+    are the absence of it, and darkening them made an empty field look filled.
+  */
+  --hint: #aab0bb;
+  --line: #e8eaef;
+  --line-strong: #d7dbe3;
+  --accent: #0891b2;
+  --accent-hover: #077e9b;
+  --accent-ink: #ffffff;
+  --accent-soft: #eaf6f9;
+  --bad: #f44336;
+  --bad-ink: #ffffff;
+  /* The explorer's own verdict colours, so one judgement reads the same in both */
+  --good: #4caf50;
+  --warn: #ef930b;
+  /*
+    Warn carried down to where it can be read. It is made to fill a shape behind
+    a white mark, and as text against the panel it measured 2.37. This clears 5.
+  */
+  --warn-deep: #a35c00;
+  --overlay: rgba(20, 24, 33, 0.45);
+  --shadow-card: 0 1px 2px rgb(20 24 33 / 0.04);
+  --shadow-hover: 0 3px 10px rgb(20 24 33 / 0.08);
+  --shadow-lift: 0 18px 42px rgb(20 24 33 / 0.22);
+}
+
+@theme inline {
+  /*
+    Two layers below. shadcn writes the first set of names into the components
+    it generates, so those names have to mean what it thinks they mean. An
+    accent is its hover wash, not our teal. The rest belong to the wallet and
+    survive because shadcn has no word for them.
+  */
+  --color-background: var(--ground);
+  --color-foreground: var(--ink);
+  --color-card: var(--panel);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--panel);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--accent-ink);
+  --color-secondary: var(--recess);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--recess);
+  --color-muted-foreground: var(--lead);
+  --color-accent: var(--hover);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--bad);
+  --color-destructive-foreground: var(--bad-ink);
+  --color-border: var(--line);
+  --color-input: var(--line-strong);
+  --color-ring: var(--accent);
+
+  --color-primary-hover: var(--accent-hover);
+  --color-primary-soft: var(--accent-soft);
+  --color-dim: var(--dim);
+  --color-hint: var(--hint);
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-warn-deep: var(--warn-deep);
+  --color-overlay: var(--overlay);
+
+  /*
+    md and lg are the wallet's two corners, four on a control and six on a
+    panel. The steps around them keep whatever else a generated component asks
+    for in proportion.
+  */
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
+  --radius-xl: 8px;
+  --radius-2xl: 12px;
+  --radius-3xl: 16px;
+  --radius-4xl: 24px;
+
+  --shadow-card: var(--shadow-card);
+  --shadow-hover: var(--shadow-hover);
+  --shadow-lift: var(--shadow-lift);
+
+  --font-sans: var(--sans);
+  /* Addresses and balances stay marked as machine text, but they render in the
+     same face as everything else. Point this at a real mono to change that. */
+  --font-mono: var(--sans);
+}
+
+/*
+  Tailwind leaves a bare border at currentColor, which reads as the text colour.
+  Generated components write the width and leave the palette to supply the rest,
+  so the line colour is the default here.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-border);
+  }
+}
+
+/* A column so the footer sits at the bottom of a page with little on it */
+#root {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  /* Digits line up in columns without a monospace face */
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Prose colours mapped onto the wallet palette */
+.prose {
+  --tw-prose-body: var(--ink);
+  --tw-prose-headings: var(--ink);
+  --tw-prose-bold: var(--ink);
+  --tw-prose-links: var(--accent);
+  --tw-prose-code: var(--ink);
+  --tw-prose-pre-code: var(--ink);
+  --tw-prose-pre-bg: var(--recess);
+  --tw-prose-quotes: var(--lead);
+  --tw-prose-quote-borders: var(--line-strong);
+  --tw-prose-counters: var(--lead);
+  --tw-prose-bullets: var(--dim);
+  --tw-prose-hr: var(--line);
+  --tw-prose-th-borders: var(--line-strong);
+  --tw-prose-td-borders: var(--line);
+  --tw-prose-captions: var(--lead);
+
+  :where(h1, h2, h3, h4):not(:where(.not-prose *)) {
+    font-size: 1em;
+    font-weight: 600;
+  }
+  :where(h1):not(:where(.not-prose *)) {
+    font-size: 1.125em;
+  }
+  :where(code):not(:where(pre *, .not-prose *))::before,
+  :where(code):not(:where(pre *, .not-prose *))::after {
+    content: none;
+  }
+  :where(div:has(> table)):not(:where(.not-prose *)) {
+    margin-block: 1.25em;
+  }
+}
+
+/* Dragging a card must not turn into a text selection or a page scroll */
+.dragging,
+.dragging * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* User-selected mobile wallet theme. */
+:root.dark {
+  color-scheme: dark;
+  --ground: #10141c; --panel: #1b2230; --recess: #222c3b;
+  --hover: #2b3647; --ink: #f2f5fa; --lead: #c1c9d7; --dim: #a6b2c4;
+  --hint: #8895a9; --line: #354154; --line-strong: #48556b;
+  --accent: #1aa7c5; --accent-hover: #29bbd8; --accent-ink: #07161b;
+  --accent-soft: #153845; --overlay: rgba(0,0,0,.7);
+  --shadow-card: 0 1px 2px rgba(0,0,0,.3);
+  --shadow-hover: 0 3px 10px rgba(0,0,0,.3);
+}
+
+/* Visual Phase 2: consistent touch targets, mobile viewport and readable cards. */
+html { -webkit-text-size-adjust: 100%; }
+body { overflow-x: hidden; }
+button, input, textarea, select { touch-action: manipulation; }
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 480px) {
+  [role="dialog"] { max-width: 100vw; }
+  [role="dialog"] input, [role="dialog"] textarea { font-size: 16px; }
+  .prose { overflow-wrap: anywhere; }
+  .prose a { overflow-wrap: anywhere; }
+}
+
+/* Mobile keyboard, device cutouts and narrow Android viewports. */
+html { min-width: 0; overflow-x: hidden; }
+body { min-width: 0; overflow-x: hidden; }
+input, textarea, select { max-width: 100%; font-size: max(16px, 1em); }
+[role="dialog"] { max-height: 100dvh; overscroll-behavior: contain; }
+@media (max-width: 380px) {
+  main { min-width: 0; }
+  nav[aria-label="Main navigation"] { font-size: 10px; }
+}
+@supports (height: 100dvh) {
+  [role="dialog"] { max-height: calc(100dvh - env(safe-area-inset-top, 0px)); }
+}

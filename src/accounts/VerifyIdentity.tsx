@@ -1,0 +1,354 @@
+import { useEffect, useState } from 'react'
+import { IDENTITY_CHECK_FEE } from '@/chain/config'
+import {
+  carriedBy,
+  depositFor,
+  dropped,
+  identityFrom,
+  LABELS,
+  named,
+  overlong,
+  pictured,
+  seatOf,
+  type Profile,
+  type Proven,
+} from '@/chain/identity'
+import { useChain } from '@/chain/provider'
+import { useFacts, useRegistrars, useStanding, useSymbol } from '@/chain/queries'
+import {
+  alive,
+  minutesLeft,
+  PROVIDER_NAMES,
+  PROVIDERS,
+  verify,
+  VerifyError,
+  type Provider,
+} from '@/chain/verify'
+import { cn } from '@/lib/cn'
+import { formatAmount } from '@/lib/balance'
+import { Button } from '@/components/ui/button'
+import { Facts, type Fact } from '@/ui/Facts'
+import { Trash2 } from 'lucide-react'
+import { FieldError, NOTE } from '@/components/ui/field'
+import { Item, ItemActions, ItemContent, ItemGroup } from '@/components/ui/item'
+import { CallPage, SignerField, useLaunch, useSigning } from './Authorize'
+import type { IdentityFormProps } from './IdentityModal'
+import { IdentityLine } from './IdentityLine'
+
+const list = new Intl.ListFormat('en', { type: 'conjunction' })
+
+/** Half a minute, so a row never shows a minute that has already gone. */
+const TICK_MS = 30_000
+
+/**
+ * The wall clock, read afresh each render and nudged so the renders keep
+ * coming. A sign in dies on its own while the dialog sits open, and both the
+ * rows and the bill have to notice that without a click.
+ */
+function useNow(every: number): number {
+  const [, tick] = useState(0)
+  useEffect(() => {
+    const timer = setInterval(() => tick((count) => count + 1), every)
+    return () => clearInterval(timer)
+  }, [every])
+  return Date.now()
+}
+
+/**
+ * Signing in proves a handle and the dialog holds it, since a proof is spent by
+ * one judgement and every channel has to ride the same signature. That
+ * signature pays the treasury one price per sign in, a transfer the judge
+ * matches against this very extrinsic. The other tab is for whoever wants a
+ * record carrying claims no bot can check.
+ */
+export function VerifyIdentity({
+  account,
+  signers,
+  tabs,
+  draft,
+  patch,
+  sent,
+  onClose,
+}: IdentityFormProps) {
+  const { network } = useChain()
+  const symbol = useSymbol()
+  const { data: standing } = useStanding(account.address)
+  const { data: registrars } = useRegistrars()
+  const { data: facts } = useFacts()
+  const registration = standing?.own ?? null
+  const { signer, bench, choose, wrap, submit, needsPassword } = useSigning(account, signers)
+  const launch = useLaunch()
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState<Provider | 'signing' | null>(null)
+  // A channel that will not prove answers in its own row, the signature
+  // answers under the password
+  const [failed, setFailed] = useState<Partial<Record<Provider, string>>>({})
+  // Dropping a checked handle is an intent for this signature alone, so it
+  // dies with the dialog instead of riding the draft
+  const [removed, setRemoved] = useState<Partial<Record<Provider, boolean>>>({})
+  const [error, setError] = useState('')
+
+  const now = useNow(TICK_MS)
+
+  // The form owns a field the moment somebody types, before that the chain does
+  const profile: Profile = {
+    display: draft.display ?? registration?.info.display ?? '',
+    avatar: draft.avatar ?? registration?.info.avatar ?? '',
+    bio: draft.bio ?? registration?.info.bio ?? '',
+  }
+  const hasName = named(profile.display)
+  const hasPicture = pictured(profile.avatar)
+  const checks = alive(draft.checks, now)
+  const loses = dropped(registration ?? null)
+
+  const registrar = seatOf(registrars ?? [], network.registrar)
+
+  // A handle the bot already stands behind opens proved and rides for free,
+  // only a sign in past what the chain holds is on the bill
+  const carried = carriedBy(registration, registrar)
+  const fresh = PROVIDERS.filter((provider) => {
+    const check = checks[provider]
+    return check !== undefined && check.handle !== carried[provider]
+  })
+  const worn: Proven = {
+    telegram: checks.telegram?.handle ?? (removed.telegram ? '' : (carried.telegram ?? '')),
+    discord: checks.discord?.handle ?? (removed.discord ? '' : (carried.discord ?? '')),
+  }
+  const proven = PROVIDERS.filter((provider) => worn[provider] !== '').length
+  const emptied =
+    proven === 0 && PROVIDERS.some((provider) => removed[provider] && carried[provider])
+  const cost = IDENTITY_CHECK_FEE * BigInt(fresh.length)
+  const record = identityFrom(profile, worn)
+  const stuck =
+    (needsPassword && password === '') ||
+    overlong(record).length > 0 ||
+    !hasName ||
+    !hasPicture
+
+  // The judgement fee is the chain's own rail. Filing while a paid request
+  // still stands would break the whole batch, so the open request rides
+  // instead of a second filing
+  const asked =
+    registration?.judgements.some(
+      (verdict) => verdict.registrar === registrar?.index && verdict.judgement === 'FeePaid',
+    ) ?? false
+
+  // What the form would sign, quoted by the bill and the fee whether or not a
+  // channel has been proved yet. The two states with nothing to quote say so
+  // in place of the bill. The chain says where the sign fee lands, so there is
+  // no call to build until it has answered
+  const operation =
+    registrar !== undefined && facts !== undefined && !emptied
+      ? ({
+          kind: 'registerIdentity',
+          info: record,
+          registrar: asked ? null : { index: registrar.index, maxFee: registrar.fee },
+          pay: { to: facts.treasury, amount: cost },
+        } as const)
+      : null
+
+  // Signing needs a channel proved, quoting the price of one does not
+  const signable = operation !== null && proven > 0
+
+  // Every coin the record costs, in one place. The sign fee goes to the
+  // treasury, the judgement fee is the chain collecting what the registrar
+  // declared, the reserve rides the record
+  const bill: Fact[] = [
+    {
+      name: 'Sign fee',
+      value: `${fresh.length} × ${formatAmount(IDENTITY_CHECK_FEE, { precision: 4 })} = ${formatAmount(cost, { precision: 4 })} ${symbol}`,
+    },
+    ...(registrar !== undefined && !asked
+      ? [
+          {
+            name: 'Judgement',
+            value: `${formatAmount(registrar.fee, { precision: 4 })} ${symbol}`,
+          },
+        ]
+      : []),
+    ...(facts
+      ? [
+          {
+            name: 'Reserve',
+            value: `${formatAmount(depositFor(record, facts.identityBasicDeposit, facts.identityByteDeposit), { precision: 2 })} ${symbol}`,
+          },
+        ]
+      : []),
+  ]
+
+  const run = async (provider: Provider) => {
+    setFailed((was) => ({ ...was, [provider]: undefined }))
+    setError('')
+    setBusy(provider)
+    try {
+      const outcome = await verify(network, provider, account.address)
+      const handle = outcome.proven[provider]
+      if (!handle) throw new VerifyError('The site proved nothing for this channel')
+      patch({
+        checks: {
+          ...checks,
+          [provider]: { handle, expiresAt: outcome.expiresAt },
+        },
+      })
+      setRemoved((was) => ({ ...was, [provider]: false }))
+    } catch (problem) {
+      const why = problem instanceof Error ? problem.message : 'Nothing was proved'
+      setFailed((was) => ({ ...was, [provider]: why }))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  // One press takes back one layer, the sign in held here before the handle the
+  // chain stands behind, so what goes is what the row says is riding
+  const remove = (provider: Provider) => {
+    if (checks[provider]) patch({ checks: { ...draft.checks, [provider]: undefined } })
+    else setRemoved((was) => ({ ...was, [provider]: true }))
+  }
+
+  const send = async () => {
+    // Enter reaches the form whether or not the button is drawn
+    if (!operation || !signable) return
+
+    // A sign in that expired while the dialog sat open would be paid for and
+    // never judged, so the moment of signing rechecks what the price bought
+    const standing = alive(draft.checks)
+    if (fresh.some((provider) => standing[provider] === undefined)) {
+      patch({ checks: standing })
+      setError('A sign in expired, verify that channel again')
+      return
+    }
+
+    setError('')
+    setBusy('signing')
+    try {
+      await launch([submit(operation, password)], { sent })
+      onClose()
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'The identity was refused')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const form = () => {
+    void send()
+    return false
+  }
+
+  return (
+    <CallPage
+      title="On chain identity"
+      submitLabel={signable ? 'Sign and send' : null}
+      busy={busy === 'signing'}
+      cancelLabel="Close"
+      disabled={stuck || busy !== null}
+      aside={tabs}
+      from={signer.address}
+      needsPassword={needsPassword}
+      operation={operation ? wrap(operation) : null}
+      password={password}
+      onPassword={setPassword}
+      error={error}
+      onClose={onClose}
+      onSubmit={form}
+    >
+      {loses.length > 0 && (
+        <p className="mb-3 text-[12.5px] text-destructive">
+          This replaces what is on chain now, so {list.format(loses.map((field) => LABELS[field]))}{' '}
+          {loses.length === 1 ? 'goes' : 'go'} with it.
+        </p>
+      )}
+
+      <IdentityLine
+        field="display"
+        value={profile.display}
+        onChange={(next) => patch({ display: next })}
+      />
+      {proven > 0 && !hasName && <FieldError>The record needs a display name</FieldError>}
+      <IdentityLine
+        field="avatar"
+        value={profile.avatar}
+        onChange={(next) => patch({ avatar: next })}
+      />
+      {!hasPicture && (
+        <FieldError>
+          The avatar needs an https address ending in .png, .jpg, .jpeg, .gif or .webp
+        </FieldError>
+      )}
+      <IdentityLine field="bio" value={profile.bio} onChange={(next) => patch({ bio: next })} />
+
+
+      {/* One channel a row, and the two states beside the button answer
+          different questions. What the chain stands behind outlives this
+          dialog, while a sign in held here is good for an hour */}
+      <ItemGroup className="mt-4 gap-2.5">
+        {PROVIDERS.map((provider) => {
+          const name = PROVIDER_NAMES[provider]
+          const held = checks[provider]
+          const stood = carried[provider]
+          const riding = worn[provider] !== ''
+          const trouble = failed[provider]
+          const state = held
+            ? `Signed in as ${held.handle}, ${minutesLeft(held.expiresAt, now)} min left`
+            : draft.checks[provider]
+              ? 'The sign in expired'
+              : stood && removed[provider]
+                ? 'Comes off the record when you sign'
+                : 'Not signed in'
+          return (
+            <Item key={provider} className="gap-3.5 p-0">
+              {/* Half the row apiece, so the states line up in a column */}
+              <Button
+                type="button"
+                variant={riding ? 'outline' : 'default'}
+                className="w-1/2 shrink-0"
+                disabled={busy !== null}
+                onClick={() => void run(provider)}
+              >
+                {busy === provider ? `Waiting for ${name}…` : `Verify with ${name}`}
+              </Button>
+              <ItemContent className="text-[12.5px] leading-[1.5]">
+                <p className={cn('truncate', stood && riding ? 'text-good' : 'text-dim')}>
+                  {stood ? `Checked on chain as ${stood}` : 'Never checked'}
+                </p>
+                <p className={trouble ? 'text-destructive' : 'truncate text-dim'}>{trouble ?? state}</p>
+              </ItemContent>
+              {riding && (
+                <ItemActions>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`Remove ${name}`}
+                    disabled={busy !== null}
+                    onClick={() => remove(provider)}
+                  >
+                    <Trash2 />
+                  </Button>
+                </ItemActions>
+              )}
+            </Item>
+          )
+        })}
+      </ItemGroup>
+
+      {registrar === undefined ? (
+        <p className={cn('mt-3', NOTE)}>
+          Nobody on this chain checks sign ins automatically yet.
+        </p>
+      ) : emptied ? (
+        <p className="mt-3.5 text-[12.5px] text-muted-foreground">
+          Every channel is off this record, so there is nothing left to sign. Clear on chain
+          identity in the account menu takes the whole identity down.
+        </p>
+      ) : (
+        <div className="mt-3.5">
+          <Facts rows={bill} />
+        </div>
+      )}
+
+      <SignerField account={account} signer={signer} bench={bench} onChange={choose} />
+    </CallPage>
+  )
+}

@@ -1,0 +1,445 @@
+import { memo, type ReactNode } from 'react'
+import { useSortable } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
+import type { AccountBalance } from '@/chain/types'
+import { lockedOf, totalOf, ZERO_BALANCE } from '@/chain/types'
+import { backing, labelOf, pendingWith, seatOf, type Standing } from '@/chain/identity'
+import { IdentityVerdict } from './IdentityVerdict'
+import { useRegistrars, useStanding, useSymbol } from '@/chain/queries'
+import { shorten } from '@/lib/address'
+import { formatAmount } from '@/lib/balance'
+import { useChain } from '@/chain/provider'
+import { Badge } from '@/components/ui/badge'
+import { cn } from '@/lib/cn'
+import { Button } from '@/components/ui/button'
+import { Card, CardAction, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+import { CopyButton } from '@/ui/CopyButton'
+import { DECIMALS, explorerAccount } from '@/chain/config'
+import {
+  Award,
+  Ban,
+  GitBranch,
+  Coins,
+  Handshake,
+  HardDrive,
+  ExternalLink,
+  Eye,
+  IdCard,
+  KeyRound,
+  Users,
+  Pencil,
+  PiggyBank,
+  Waypoints,
+  Puzzle,
+  Download,
+  ServerCog,
+  Stamp,
+  Signature,
+  Trash2,
+  LockOpen,
+} from 'lucide-react'
+import { Identicon } from '@/ui/Identicon'
+import { Menu, type MenuSection } from '@/ui/Menu'
+import { Tip } from '@/ui/Tip'
+import { canSend, signsAlone, type Account } from './types'
+
+/**
+ * Which dialog a card asks the page to open. A card knows its own account, so
+ * the name is all the page needs.
+ */
+export type CardAction =
+  | 'send'
+  | 'receive'
+  | 'renameAccount'
+  | 'forget'
+  | 'backup'
+  | 'changePassword'
+  | 'identity'
+  | 'judgement'
+  | 'judge'
+  | 'setFee'
+  | 'clearIdentity'
+  | 'quitSub'
+  | 'derive'
+  | 'delegate'
+  | 'undelegate'
+  | 'addProxy'
+  | 'removeProxy'
+  | 'unlock'
+  | 'pending'
+  | 'subs'
+  | 'vesting'
+  | 'sign'
+  | 'metaMaskSend'
+  | 'validator'
+  | 'tokenBalances'
+
+interface CardProps {
+  account: Account
+  balance: AccountBalance | undefined
+  /** How a card asks for a dialog. Nothing in this file opens one itself. */
+  open: (action: CardAction, account: Account) => void
+}
+
+/** What kind of account this is, when it is not simply one the wallet can sign for. */
+const WATCHING = { icon: <Eye className="size-3" />, label: 'watch' }
+
+const BADGES: Partial<Record<Account['source'], { icon: ReactNode; label: string }>> = {
+  keystore: { icon: <HardDrive className="size-3" />, label: 'local' },
+  extension: { icon: <Puzzle className="size-3" />, label: 'extension' },
+  multisig: { icon: <Users className="size-3" />, label: 'multisig' },
+  proxied: { icon: <Waypoints className="size-3" />, label: 'proxied' },
+  watch: WATCHING,
+}
+
+const CANNOT_SEND: Partial<Record<Account['source'], string>> = {
+  multisig: 'No signatory of this multisig is in this wallet',
+  proxied: 'The account it acts through is not in this wallet',
+  watch: 'Watch only account',
+}
+
+/**
+ * Text somebody may want to pick out by hand. The card is one big drag handle,
+ * and a drag and a selection are the same gesture, so whatever a person reads
+ * has to opt out of the drag to become selectable at all.
+ */
+const PICKABLE = 'cursor-text select-text'
+
+/**
+ * What the chain says this account is, which is not what the wallet calls it.
+ * The verdict is the whole point, so it leads, and whether the account clears
+ * the standard governance and validator entry gate on hangs off the same mark.
+ */
+function IdentityMark({ standing }: { standing: Standing }) {
+  // A flex gap counts elements rather than their width, so an account no
+  // registrar has ever seen would leave an empty span here and push the address
+  // out of line with the name above it
+  if (!backing(standing)) return null
+
+  const name = labelOf(standing)
+
+  return (
+    <span data-nodrag className={cn('flex min-w-0 shrink items-center gap-1', PICKABLE)}>
+      <IdentityVerdict standing={standing} />
+      {/* Four cards to a row leaves a long name truncated, so it is reachable */}
+      {name && (
+        <Tip text={name}>
+          <span className="truncate text-[12.5px] font-semibold">{name}</span>
+        </Tip>
+      )}
+    </span>
+  )
+}
+
+/** Only the EVM row is labelled, the Numen address is the one the card is about. */
+function AddressRow({
+  kind,
+  label,
+  full,
+  short,
+  explorer,
+  children,
+}: {
+  kind: string
+  label?: string
+  full: string
+  short: string
+  explorer?: string
+  children?: ReactNode
+}) {
+  return (
+    <div className="mt-px flex items-center gap-1.5 text-muted-foreground">
+      {children}
+      {label && (
+        <Badge variant="muted">{label}</Badge>
+      )}
+      <span data-nodrag className={cn('shrink-0 font-mono text-[12.5px]', PICKABLE)}>
+        {short}
+      </span>
+      <CopyButton text={full} label={`Copy ${kind} address`} />
+      {explorer && (
+        // A new tab, since the wallet has nothing to index history with and no
+        // business holding a worse copy of what the explorer already shows
+        <Tip text="View on the explorer">
+          <Button asChild variant="plain" size="icon-xs" data-nodrag>
+            <a href={explorer} target="_blank" rel="noopener" aria-label="View on the explorer">
+              <ExternalLink />
+            </a>
+          </Button>
+        </Tip>
+      )}
+    </div>
+  )
+}
+
+function CardBody({
+  account,
+  balance,
+  open,
+}: CardProps) {
+  const { network } = useChain()
+  const symbol = useSymbol()
+  const { data: standing } = useStanding(account.address)
+  const { data: registrars } = useRegistrars()
+  // An account whose balance has not landed yet reads as an empty one, since
+  // that is what an empty account looks like and a dash only reads as broken
+  const holdings = balance ?? ZERO_BALANCE
+  const local = account.source === 'keystore'
+  const badge = BADGES[account.source]
+  // A multisig or a proxied account nobody here can sign for is watched and
+  // nothing else. The menu says as much by leaving items out, which reads as
+  // missing rather than as locked, so the card says it in a word
+  const watched = account.source !== 'watch' && !canSend(account)
+  // The menu writes to this account's own record, so a parent's is no answer here
+  const identity = standing?.own ?? null
+  const asked = pendingWith(identity) !== null
+  // Nothing here holds the key to an EVM address, so whatever leaves one is a
+  // call MetaMask signs rather than one the wallet sends
+  const viaMetaMask = account.evmAddress !== null
+  const shut = !viaMetaMask && !canSend(account)
+  // Which registrar this account is, if the chain lists it as one
+  const seat = seatOf(registrars ?? [], account.address)
+
+  const ask = (action: CardAction) => () => open(action, account)
+
+  // Everything the chain records about who holds this account, its own and
+  // anybody else's. An account with none of it gets no heading for it
+  const identityItems = [
+    ...(canSend(account)
+      ? [
+          {
+            label: identity ? 'Edit the on chain identity' : 'Set an on chain identity',
+            icon: <IdCard />,
+            onSelect: ask('identity'),
+          },
+        ]
+      : []),
+    ...(canSend(account) && identity
+      ? [
+          {
+            label: asked ? 'Withdraw the request' : 'Ask a registrar',
+            icon: <Stamp />,
+            onSelect: ask('judgement'),
+          },
+          { label: 'Sub accounts', icon: <Award />, onSelect: ask('subs') },
+          { label: 'Clear on chain identity', icon: <Trash2 />, onSelect: ask('clearIdentity') },
+        ]
+      : []),
+    // A parent has no say in being dropped, and a multisig gets named a sub as
+    // easily as anything else, so this one takes whoever can sign for it
+    ...(canSend(account) && standing?.sub
+      ? [{ label: 'Reject the parent identity', icon: <Ban />, onSelect: ask('quitSub') }]
+      : []),
+  ]
+
+  // The other side of the counter, judging and pricing the work. Only an
+  // account the chain has on its registrar list gets the heading
+  const registrarItems = seat
+    ? [
+        { label: 'Judge an identity', icon: <Stamp />, onSelect: ask('judge') },
+        { label: 'Set the judgement fee', icon: <Coins />, onSelect: ask('setFee') },
+      ]
+    : []
+
+  const menu: MenuSection[] = [
+    {
+      label: 'Account',
+      // The set-once key admin sits above what gets done over and over
+      items: [
+        { label: 'Rename this account', icon: <Pencil />, onSelect: ask('renameAccount') },
+        ...(local
+          ? [
+              {
+                label: 'Change password',
+                icon: <KeyRound />,
+                onSelect: ask('changePassword'),
+              },
+              { label: 'Create a backup file', icon: <Download />, onSelect: ask('backup') },
+              { label: 'Derive an account', icon: <GitBranch />, onSelect: ask('derive') },
+            ]
+          : []),
+        ...(account.multisig
+          ? [
+              {
+                label: 'Multisig approvals',
+                icon: <Users />,
+                onSelect: ask('pending'),
+              },
+            ]
+          : []),
+        // A message signature comes from one key, so an account signing through
+        // its signatories or its proxy has nothing to offer here
+        ...(signsAlone(account)
+          ? [{ label: 'Sign a message', icon: <Signature />, onSelect: ask('sign') }]
+          : []),
+        ...(canSend(account)
+          ? [
+              { label: 'Vesting', icon: <PiggyBank />, onSelect: ask('vesting') },
+              { label: 'Release vote locks', icon: <LockOpen />, onSelect: ask('unlock') },
+            ]
+          : []),
+      ],
+    },
+    ...(identityItems.length > 0 ? [{ label: 'Identity', items: identityItems }] : []),
+    ...(registrarItems.length > 0 ? [{ label: 'Registrar', items: registrarItems }] : []),
+    ...(canSend(account)
+      ? [
+          {
+            label: 'Validator',
+            items: [
+              { label: 'Seat and session keys', icon: <ServerCog />, onSelect: ask('validator') },
+            ],
+          },
+        ]
+      : []),
+    ...(canSend(account)
+      ? [
+          {
+            label: 'Delegate',
+            items: [
+              { label: 'Delegate votes', icon: <Handshake />, onSelect: ask('delegate') },
+              { label: 'Take a delegation back', icon: <Handshake />, onSelect: ask('undelegate') },
+              { label: 'Add proxy', icon: <Waypoints />, onSelect: ask('addProxy') },
+              { label: 'Remove proxy', icon: <Waypoints />, onSelect: ask('removeProxy') },
+            ],
+          },
+        ]
+      : []),
+    {
+      items: [
+        { label: 'Forget this account', icon: <Trash2 />, danger: true, onSelect: ask('forget') },
+      ],
+    },
+  ]
+
+  return (
+    <>
+      <CardHeader className="flex-nowrap items-start gap-2.5">
+        <Identicon address={account.address} />
+
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-[7px]">
+            <CardTitle data-nodrag className={cn('truncate text-[15px]', PICKABLE)}>
+              {account.name}
+            </CardTitle>
+            {badge && (
+              <Badge variant="muted">
+                {badge.icon}
+                {badge.label}
+              </Badge>
+            )}
+            {watched && (
+              <Tip text={CANNOT_SEND[account.source]}>
+                <Badge variant="muted">
+                  {WATCHING.icon}
+                  {WATCHING.label}
+                </Badge>
+              </Tip>
+            )}
+          </div>
+
+          <AddressRow
+            kind="Numen"
+            full={account.address}
+            short={shorten(account.address)}
+            explorer={explorerAccount(network, account.address)}
+          >
+            {standing && <IdentityMark standing={standing} />}
+          </AddressRow>
+          {account.evmAddress && (
+            <AddressRow
+              kind="EVM"
+              label="EVM"
+              full={account.evmAddress}
+              short={shorten(account.evmAddress)}
+            />
+          )}
+        </div>
+
+        <CardAction>
+          <Menu label="Account menu" sections={menu} />
+        </CardAction>
+      </CardHeader>
+
+      <CardContent className="mt-auto pt-1">
+        {/* What the account holds, to the planck. The split under it is rounded
+            for reading, and says so */}
+        <div
+          data-nodrag
+          className={cn('font-mono text-xl font-semibold tracking-tight wrap-anywhere max-[560px]:text-base', PICKABLE)}
+        >
+          {formatAmount(totalOf(holdings), { precision: DECIMALS, pad: false })}
+          <span className="ml-1 text-[11.5px] font-bold tracking-wide">{symbol}</span>
+        </div>
+        <div data-nodrag className={cn('mt-0.5 flex flex-wrap gap-x-2 text-xs text-muted-foreground', PICKABLE)}>
+          <span>transferable {formatAmount(holdings.transferable, { precision: 2, compact: true })}</span>
+          <span>locked {formatAmount(lockedOf(holdings), { precision: 2, compact: true })}</span>
+        </div>
+      </CardContent>
+
+      <CardFooter className="grid auto-cols-fr grid-flow-col">
+        <Tip text={shut ? CANNOT_SEND[account.source] : undefined}>
+          <span className="flex has-[:disabled]:cursor-not-allowed">
+            <Button
+              type="button"
+              data-nodrag
+              className="flex-1"
+              disabled={shut}
+              onClick={ask(viaMetaMask ? 'metaMaskSend' : 'send')}
+            >
+              Send
+            </Button>
+          </span>
+        </Tip>
+        <Button type="button" variant="outline" data-nodrag onClick={ask('receive')}>
+          Receive
+        </Button>
+        {account.evmAddress && (
+          <Button type="button" variant="outline" data-nodrag onClick={ask('tokenBalances')}>
+            Tokens
+          </Button>
+        )}
+      </CardFooter>
+    </>
+  )
+}
+
+/**
+ * Dragging re-renders every sortable on every pointer move, since that is how
+ * dnd-kit hands out the transforms. None of what a card draws depends on the
+ * drag, so the body sits behind a memo and only the article moves.
+ */
+export const AccountCardBody = memo(CardBody)
+
+const CARD = 'transition-colors select-none touch-pan-y'
+
+export function AccountCard(props: CardProps) {
+  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: props.account.address,
+    data: { type: 'card' },
+  })
+
+  return (
+    <Card
+      ref={setNodeRef}
+      style={{ transform: CSS.Translate.toString(transform), transition }}
+      {...listeners}
+      className={cn(
+        CARD,
+        'cursor-grab hover:border-input hover:shadow-hover',
+        isDragging && 'opacity-35 outline-[1.5px] outline-dashed outline-primary -outline-offset-2',
+      )}
+    >
+      <AccountCardBody {...props} />
+    </Card>
+  )
+}
+
+/** What follows the pointer during a drag. */
+export function AccountCardGhost(props: CardProps) {
+  return (
+    <Card className={cn(CARD, 'h-full cursor-grabbing shadow-lift')}>
+      <AccountCardBody {...props} />
+    </Card>
+  )
+}

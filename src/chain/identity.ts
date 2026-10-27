@@ -1,0 +1,382 @@
+
+/**
+ * On chain identity, as numen_runtime::identity_info::IdentityInfo has it. The
+ * field order is the encoding order, so it has to match the runtime struct.
+ *
+ * Only x, telegram and discord gate anything. The rest is self description
+ * and contact detail.
+ */
+
+/** What an account writes about itself, none of it provable by anyone. */
+export const PROFILE = ['display', 'avatar', 'bio'] as const
+
+export const CONTACT = ['web', 'email', 'github', 'matrix', 'x', 'telegram', 'discord'] as const
+
+export const IDENTITY_FIELDS = [...PROFILE, ...CONTACT] as const
+
+export type IdentityField = (typeof IDENTITY_FIELDS)[number]
+
+export type IdentityInfo = Record<IdentityField, string>
+
+/** What an account says for itself, carried through every write. */
+export type Profile = Pick<IdentityInfo, (typeof PROFILE)[number]>
+
+export const EMPTY_IDENTITY: IdentityInfo = {
+  display: '',
+  avatar: '',
+  bio: '',
+  web: '',
+  email: '',
+  github: '',
+  matrix: '',
+  x: '',
+  telegram: '',
+  discord: '',
+}
+
+/** The channels the runtime's qualified identity standard accepts. */
+export const CHANNELS = ['x', 'telegram', 'discord'] as const satisfies readonly IdentityField[]
+
+/**
+ * All an automatic registration carries. Every other field is a claim nobody
+ * checked, so the automatic registrar refuses to judge a record holding one and
+ * the wallet never puts one there.
+ */
+export const KEPT = [...PROFILE, 'telegram', 'discord'] as const
+
+/** The channels the automated registrar checks, fixed by what a bot can sign into. */
+export const BOT_CHANNELS = ['telegram', 'discord'] as const satisfies readonly IdentityField[]
+
+/**
+ * What the identity site says it proved, which is all it is allowed to say. The
+ * name is not in here. A bot can prove a handle belongs to whoever signed in,
+ * it has no way to prove what they are called.
+ */
+export type Proven = Pick<IdentityInfo, (typeof BOT_CHANNELS)[number]>
+
+const profile = new Set<string>(PROFILE)
+const kept = new Set<string>(KEPT)
+
+/** One call writes the whole record, so anything else on it goes. */
+export function dropped(registration: Registration | null): IdentityField[] {
+  if (!registration) return []
+  return IDENTITY_FIELDS.filter((field) => !kept.has(field) && registration.info[field] !== '')
+}
+
+export const identityFrom = (profile: Profile, proven: Proven): IdentityInfo => ({
+  ...EMPTY_IDENTITY,
+  ...profile,
+  ...proven,
+})
+
+/** The runtime bounds each field in bytes, so a CJK name runs out fast. */
+export const MAX_BYTES: Record<IdentityField, number> = {
+  display: 32,
+  avatar: 128,
+  bio: 2048,
+  web: 64,
+  email: 32,
+  github: 32,
+  matrix: 32,
+  x: 32,
+  telegram: 32,
+  discord: 32,
+}
+
+/** Sub account names ride pallet_identity's Data, which stops at Raw32. */
+export const SUB_NAME_MAX_BYTES = 32
+
+/** Text that renders as nothing, whitespace and invisible format characters alike. */
+const BLANK = /^[\s\p{Cf}]*$/u
+
+/** A record has to go by something, and a name nobody can see is no name. */
+export const named = (display: string): boolean => !BLANK.test(display)
+
+/** An address a wallet can actually hang a picture off. */
+const PICTURE = /^https:\/\/\S+\.(?:png|jpe?g|gif|webp)$/i
+
+/** No avatar is fine, an avatar showing nothing is not. */
+export const pictured = (avatar: string): boolean => avatar === '' || PICTURE.test(avatar)
+
+export const byteLength = (text: string): number => new TextEncoder().encode(text).length
+
+export type Judgement =
+  | 'Unknown'
+  | 'FeePaid'
+  | 'Reasonable'
+  | 'KnownGood'
+  | 'OutOfDate'
+  | 'LowQuality'
+  | 'Erroneous'
+
+/**
+ * What a registrar may hand down. FeePaid stays out of it, since that one is
+ * the chain's own note that a request has been paid for and provide_judgement
+ * refuses it.
+ */
+export type Ruling = Exclude<Judgement, 'FeePaid'>
+
+/** Each ruling and what it claims. */
+export const VERDICTS: { value: Ruling; says: string }[] = [
+  { value: 'Reasonable', says: 'The data looks right. Nobody was met and no formal KYC was run' },
+  { value: 'KnownGood', says: 'The registrar knows this account directly and vouches for all of it' },
+  { value: 'OutOfDate', says: 'It was right once. Nothing malicious, and editing the identity lifts it' },
+  { value: 'LowQuality', says: 'Too vague to be worth anything. Editing the identity lifts it' },
+  { value: 'Erroneous', says: 'It is wrong, possibly on purpose. An edit will not lift this one' },
+  { value: 'Unknown', says: 'No opinion, which is where every identity starts' },
+]
+
+/**
+ * One registrar's verdict on the identity as it stood when they gave it.
+ * FeePaid locks in the price at the time of the request, so a registrar that
+ * reprices later still collects what was reserved.
+ */
+export type Verdict =
+  | { registrar: number; judgement: Ruling }
+  | { registrar: number; judgement: 'FeePaid'; fee: bigint }
+
+export interface Registration {
+  info: IdentityInfo
+  judgements: Verdict[]
+  deposit: bigint
+}
+
+/**
+ * A sub account hangs off a parent through Identity.SuperOf. It registers
+ * nothing of its own as a rule, so the name it goes by and the judgement on it
+ * both come from the parent.
+ */
+export interface SubIdentity {
+  /** What the parent calls this one, which is the second half of the label. */
+  name: string
+  parent: string
+  registration: Registration | null
+}
+
+/** One account hanging off this one, as the parent named it. */
+export interface Sub {
+  address: string
+  name: string
+}
+
+/** What the chain holds from a parent for the subs it has taken on. */
+export interface Subs {
+  deposit: bigint
+  list: Sub[]
+}
+
+/** Everything the chain says about who an address is. */
+export interface Standing {
+  own: Registration | null
+  sub: SubIdentity | null
+}
+
+/** The registration an address answers to, which is the parent's when it is a sub. */
+export function backing(standing: Standing | null): Registration | null {
+  return standing?.own ?? standing?.sub?.registration ?? null
+}
+
+/**
+ * What to call the address. The account's own record leads, the same way its
+ * verdict does, since a name from one record beside a verdict from the other
+ * describes nobody. Only an account with none of its own reads as parent over
+ * sub, the way the explorer writes it, and a parent nobody named leaves the sub
+ * with nothing to hang on.
+ */
+export function labelOf(standing: Standing | null): string {
+  if (standing?.own) return standing.own.info.display
+  const parent = standing?.sub?.registration?.info.display
+  return standing?.sub && parent ? `${parent}/${standing.sub.name}` : ''
+}
+
+export interface Registrar {
+  index: number
+  account: string
+  fee: bigint
+}
+
+/** The registrar seat this account holds, if the chain lists it as one. */
+export function seatOf(registrars: Registrar[], account: string): Registrar | undefined {
+  return registrars.find((entry) => entry.account === account)
+}
+
+/** An account allowed to hand out usernames ending in its suffix. */
+export interface UsernameAuthority {
+  suffix: string
+  account: string
+  /** How many usernames it may still hand out. */
+  allocation: number
+}
+
+/** Why pallet_identity would turn this suffix down, or null if it wouldn't. */
+export function suffixProblem(suffix: string, maxLength: number): string | null {
+  if (suffix === '') return 'Give it the suffix its usernames end in'
+  if (!/^[a-z0-9]+$/.test(suffix)) return 'A suffix takes lowercase letters and digits only'
+  if (suffix.length > maxLength) return `A suffix runs to ${maxLength} characters at most`
+  return null
+}
+
+/**
+ * The handles the bot already stands behind on this record. Its judge inherits
+ * an unchanged handle off the parent block free of charge, so these need no
+ * fresh sign in and no payment to survive a rewrite.
+ */
+export function carriedBy(
+  registration: Registration | null,
+  bot: Registrar | undefined,
+): Partial<Proven> {
+  if (!registration || !bot) return {}
+  const judged = registration.judgements.some(
+    (verdict) => verdict.registrar === bot.index && isChecked(verdict.judgement),
+  )
+  if (!judged) return {}
+
+  const held: Partial<Proven> = {}
+  for (const field of BOT_CHANNELS) {
+    if (registration.info[field] !== '') held[field] = registration.info[field]
+  }
+  return held
+}
+
+/** The two a registrar gives to an identity it has actually checked. */
+const CHECKED: Judgement[] = ['Reasonable', 'KnownGood']
+
+export const isChecked = (judgement: Judgement): boolean => CHECKED.includes(judgement)
+
+/**
+ * The qualified identity standard from numen/runtime/src/configs/governance.rs.
+ * A registrar has to have checked the identity, and it has to carry a channel
+ * somebody can be reached on. Both, or the registration gates nothing.
+ */
+function qualifies(registration: Registration | null): boolean {
+  if (!registration) return false
+  return (
+    registration.judgements.some((verdict) => isChecked(verdict.judgement)) &&
+    CHANNELS.some((channel) => registration.info[channel] !== '')
+  )
+}
+
+/**
+ * The gate itself, which the runtime asks of an account rather than of a
+ * registration. A sub passes on the parent's record, since the SuperOf link
+ * keeps the owner traceable, and it is read after the account's own.
+ */
+export function isQualified(standing: Standing | null): boolean {
+  return qualifies(standing?.own ?? null) || qualifies(standing?.sub?.registration ?? null)
+}
+
+/**
+ * What the registrars have made of this identity, as the explorer reads it. A
+ * bad verdict wins over a good one, since the point is to warn rather than to
+ * flatter, and one registrar cannot undo what another found.
+ */
+export type IdentityState = 'verified' | 'stale' | 'pending' | 'unjudged' | 'bad'
+
+export function identityState(registration: Registration): IdentityState {
+  const given = registration.judgements.map((verdict) => verdict.judgement)
+
+  if (given.some((judgement) => judgement === 'Erroneous' || judgement === 'LowQuality')) {
+    return 'bad'
+  }
+  if (given.some(isChecked)) return 'verified'
+  if (given.includes('OutOfDate')) return 'stale'
+  if (given.includes('FeePaid')) return 'pending'
+  return 'unjudged'
+}
+
+export const STATE_WORDS: Record<IdentityState, string> = {
+  verified: 'Checked by a registrar',
+  stale: 'A registrar marked this out of date',
+  pending: 'A registrar is being paid to check this',
+  unjudged: 'No registrar has checked this',
+  bad: 'A registrar rejected this',
+}
+
+/** Why the account falls short, in the order it has to fix them. */
+export function shortfall(standing: Standing | null): string | null {
+  const registration = backing(standing)
+  if (!registration) return 'This account has no on chain identity yet'
+  if (!CHANNELS.some((channel) => registration.info[channel] !== '')) {
+    return 'Add an X, Telegram or Discord handle'
+  }
+  if (!registration.judgements.some((verdict) => isChecked(verdict.judgement))) {
+    return pendingWith(registration) === null
+      ? 'Ask a registrar to check it'
+      : 'A registrar is checking it'
+  }
+  return null
+}
+
+/** The registrar already being paid to look at this, if there is one. */
+export function pendingWith(registration: Registration | null): number | null {
+  const paid = registration?.judgements.find((verdict) => verdict.judgement === 'FeePaid')
+  return paid ? paid.registrar : null
+}
+
+/**
+ * What one registrar collects for judging this, which is nothing unless the
+ * account asked them by name. Anyone may judge an identity that never asked.
+ */
+export function feePaidTo(registration: Registration | null, index: number): bigint | null {
+  const mine = registration?.judgements.find((verdict) => verdict.registrar === index)
+  return mine?.judgement === 'FeePaid' ? mine.fee : null
+}
+
+/** SCALE compact, one byte below 64, two below 16384, four beyond. */
+export const compactSize = (length: number): number => (length < 64 ? 1 : length < 16_384 ? 2 : 4)
+
+/**
+ * IdentityInfo encodes as a compact length per field followed by the bytes,
+ * which is what the chain charges for on top of the flat entry.
+ */
+export function encodedSize(info: IdentityInfo): number {
+  return IDENTITY_FIELDS.reduce((total, field) => {
+    const length = byteLength(info[field])
+    return total + compactSize(length) + length
+  }, 0)
+}
+
+export function depositFor(info: IdentityInfo, base: bigint, perByte: bigint): bigint {
+  return base + perByte * BigInt(encodedSize(info))
+}
+
+export const isEmpty = (info: IdentityInfo): boolean =>
+  IDENTITY_FIELDS.every((field) => info[field] === '')
+
+/** Fields somebody typed past the runtime bound. */
+export function overlong(info: IdentityInfo): IdentityField[] {
+  return IDENTITY_FIELDS.filter((field) => byteLength(info[field]) > MAX_BYTES[field])
+}
+
+/** The ways to reach the account, in the order the runtime holds them. */
+export function channelsOf(info: IdentityInfo): [IdentityField, string][] {
+  return IDENTITY_FIELDS.filter((field) => !profile.has(field) && info[field] !== '').map(
+    (field): [IdentityField, string] => [field, info[field]],
+  )
+}
+
+export const LABELS: Record<IdentityField, string> = {
+  display: 'Display name',
+  avatar: 'Avatar',
+  bio: 'Bio',
+  web: 'Website',
+  email: 'Email',
+  github: 'GitHub',
+  matrix: 'Matrix',
+  x: 'X',
+  telegram: 'Telegram',
+  discord: 'Discord',
+}
+
+export const PLACEHOLDERS: Record<IdentityField, string> = {
+  display: 'The name this account goes by',
+  avatar: 'https://example.com/you.png',
+  bio: 'The first line is the Short Bio; the rest is the Full Bio.',
+  web: 'https://example.com',
+  email: 'you@example.com',
+  github: 'you',
+  matrix: '@you:matrix.org',
+  x: '@you',
+  telegram: '@you',
+  discord: 'you',
+}

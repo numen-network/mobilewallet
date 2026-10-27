@@ -1,0 +1,49 @@
+/* Capacitor mobile safe areas and touch ergonomics */
+html { -webkit-text-size-adjust: 100%; }
+body { padding-top: 0; padding-bottom: 0; overscroll-behavior-y: none; }
+button, a, input, select, textarea { touch-action: manipulation; }
+input, select, textarea { font-size: max(16px, 1em); }
+
+/* The tab bar stays above Android's gesture/navigation area, not below the viewport.
+   Reserve its complete height for scrolling content, including short pages. */
+:root { --numen-nav-safe-bottom: max(env(safe-area-inset-bottom, 0px), 16px); --numen-nav-content-height: 64px; }
+#root { padding-bottom: calc(var(--numen-nav-content-height) + var(--numen-nav-safe-bottom)); }
+.numen-bottom-navigation { padding-bottom: var(--numen-nav-safe-bottom); }
+.numen-bottom-navigation-items { min-height: var(--numen-nav-content-height); padding-top: 5px; padding-bottom: 5px; }
+@media (max-width: 360px) { .numen-bottom-navigation-items { column-gap: 0; } .numen-bottom-navigation-items button { font-size: 9px; } }
+/* Keyboard may reduce the visual viewport on Android. The tab bar must not
+   obscure the input being edited; hide it while a text control has focus. */
+@supports selector(body:has(input:focus)) {
+  body:has(input:focus) .numen-bottom-navigation,
+  body:has(textarea:focus) .numen-bottom-navigation { display: none; }
+}
+
+/* Settings is a full-screen modal: do not leave app navigation behind/over it. */
+body:has([aria-label="Wallet settings"][role="dialog"]) .numen-bottom-navigation { display: none !important; }
+body:has([aria-label="Wallet settings"][role="dialog"]) #root { padding-bottom: 0; }
+/* Compact devices: preserve labels and tap targets above gesture bar. */
+.numen-bottom-navigation { box-sizing: border-box; }
+.numen-bottom-navigation-items button { min-height: 54px; line-height: 1.2; }
+@media (max-width: 375px) { .numen-bottom-navigation-items button { font-size: 9px; } }
+
+/* Scroll fix: Radix panels previously used display:contents, leaving no reliable
+   scrollable viewport in Android WebView. Every primary page now owns its scroll. */
+@media (max-width: 767px) {
+  html, body { height: 100%; overflow-x: hidden; }
+  #root { height: 100dvh; min-height: 0; padding-bottom: 0; overflow: hidden; }
+  #root > header { flex-shrink: 0; }
+  [data-slot="tabs-content"].numen-page-scroll {
+    display: block;
+    flex: 1 1 0;
+    min-height: 0;
+    width: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+    padding-bottom: calc(var(--numen-nav-content-height) + var(--numen-nav-safe-bottom) + 14px);
+  }
+  /* Dialogs remain independently scrollable and are not covered by navigation. */
+  [role="dialog"] { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+}

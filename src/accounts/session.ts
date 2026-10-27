@@ -1,0 +1,90 @@
+import { create } from 'zustand'
+import type { CallArg, Operation, TxStage } from '@/chain/types'
+import { replaceBigInt, reviveBigInt } from '@/lib/json'
+
+/**
+ * What this tab has submitted, and how far each one got. It lives in
+ * sessionStorage, so a reload keeps it and closing the tab loses it, which is
+ * the honest lifetime for a list the wallet cannot rebuild.
+ *
+ * An account's real history is on chain and belongs to the explorer. This only
+ * answers what happened while the page was open.
+ */
+
+const STORAGE_KEY = 'numen-wallet-session-v1'
+
+export interface Submission {
+  id: string
+  address: string
+  operation: Operation
+  stage: TxStage
+  hash: string
+  /**
+   * What went out, under the runtime's own name for it and argument by
+   * argument. Kept here rather than worked out again on the page, so the log
+   * reads the same after a reload and with the node gone.
+   */
+  call?: { name: string; args: CallArg[] }
+  /** What the chain refused it for, once it has refused it. */
+  error?: string
+  /** The refusal as the chain put it, where it said more than the reading of it. */
+  detail?: string | undefined
+  at: number
+}
+
+interface SessionState {
+  submissions: Submission[]
+  record: (address: string, operation: Operation) => string
+  encode: (id: string, call: { name: string; args: CallArg[] }) => void
+  advance: (id: string, stage: TxStage, hash: string) => void
+  fail: (id: string, error: string, detail?: string) => void
+  forAccount: (address: string) => Submission[]
+}
+
+function read(): Submission[] {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY)
+    const parsed: unknown = raw ? JSON.parse(raw, reviveBigInt) : []
+    return Array.isArray(parsed) ? (parsed as Submission[]) : []
+  } catch {
+    return []
+  }
+}
+
+function write(submissions: Submission[]): void {
+  try {
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(submissions, replaceBigInt))
+  } catch {
+    // A tab that cannot remember what it sent still sent it
+  }
+}
+
+let counter = 0
+
+export const useSessionStore = create<SessionState>((set, get) => {
+  const save = (submissions: Submission[]) => {
+    write(submissions)
+    set({ submissions })
+  }
+
+  const patch = (id: string, fields: Partial<Submission>) =>
+    save(get().submissions.map((entry) => (entry.id === id ? { ...entry, ...fields } : entry)))
+
+  return {
+    submissions: read(),
+
+    record: (address, operation) => {
+      const id = `s${(counter += 1)}-${Date.now()}`
+      save([{ id, address, operation, stage: 'signed', hash: '', at: Date.now() }, ...get().submissions])
+      return id
+    },
+
+    encode: (id, call) => patch(id, { call }),
+
+    advance: (id, stage, hash) => patch(id, { stage, hash }),
+
+    fail: (id, error, detail) => patch(id, { error, detail }),
+
+    forAccount: (address) => get().submissions.filter((entry) => entry.address === address),
+  }
+})

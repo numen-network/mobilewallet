@@ -1,0 +1,221 @@
+import { describe as group, expect, it } from 'vitest'
+import { UNIT } from '@/chain/config'
+import type { Motion } from '@/chain/governance'
+import { createMockRepository } from '@/chain/mock'
+import type { Operation } from '@/chain/types'
+import { describe } from './activity'
+
+const TO = 'nu3oNksEGXV3Tsr4sBeRUpcfA5zYp4VvZ7t9uKVPMAe2UCo98'
+const OTHER = 'nu2uaQWzSyDzXHrgd78sQL2871qL2LpPU6kHeeb4ETtXfnASg'
+const MULTISIG = 'nu2ojmYR9qXUFZgJkJSmfjzJRDakd1GaY6g96HX6QgeT5gWJQ'
+
+const pay = (to: string, whole: bigint): Operation => ({
+  kind: 'transfer',
+  to,
+  amount: whole * UNIT,
+})
+
+const said = (operation: Operation) => describe(operation, 'tNUMN')
+
+group('a call read out argument by argument', () => {
+  it('names what it carries rather than writing a sentence', () => {
+    expect(said(pay(TO, 1n))).toEqual({
+      title: 'Transfer',
+      fields: [
+        { name: 'amount', value: '1.0000 tNUMN' },
+        { name: 'to', value: 'nu3oNks…Co98' },
+      ],
+    })
+  })
+
+  it('has nothing to write out for a call that carries nothing', () => {
+    expect(said({ kind: 'vest' })).toEqual({ title: 'Release what has vested', fields: [] })
+  })
+
+  it('says whose schedule a release is for', () => {
+    expect(said({ kind: 'vestOther', target: TO })).toEqual({
+      title: 'Release what has vested',
+      fields: [{ name: 'for', value: 'nu3oNks…Co98' }],
+    })
+  })
+
+  it('says whose vote is taken back off somebody else', () => {
+    expect(said({ kind: 'removeOtherVote', target: TO, track: 30, poll: 12 })).toEqual({
+      title: 'Take back the vote on 12',
+      fields: [
+        { name: 'track', value: 'Track 30' },
+        { name: 'for', value: 'nu3oNks…Co98' },
+      ],
+    })
+  })
+
+  it('hangs what a wrapper adds off the end of what it wraps', () => {
+    expect(said({ kind: 'asProxy', real: OTHER, call: pay(TO, 1n) })).toEqual({
+      title: 'Transfer',
+      fields: [
+        { name: 'amount', value: '1.0000 tNUMN' },
+        { name: 'to', value: 'nu3oNks…Co98' },
+        { name: 'as', value: 'nu2uaQW…nASg' },
+      ],
+    })
+  })
+})
+
+group('a referendum in the log', () => {
+  const propose = (track: number, motion: Motion): Operation => ({
+    kind: 'propose',
+    track,
+    motion,
+    title: 'A title',
+    description: '',
+  })
+
+  it('says what a spend pays and where', () => {
+    const payouts = [{ amount: UNIT, beneficiary: TO, validFrom: null }]
+    expect(said(propose(30, { kind: 'spend', payouts })).fields).toEqual([
+      { name: 'amount', value: '1.0000 tNUMN' },
+      { name: 'to', value: 'nu3oNks…Co98' },
+      { name: 'track', value: 'Track 30' },
+    ])
+  })
+
+  it('names the referendum a brake would stop', () => {
+    expect(said(propose(20, { kind: 'cancel', poll: 4 })).fields).toEqual([
+      { name: 'cancels', value: '4' },
+      { name: 'track', value: 'Track 20' },
+    ])
+  })
+
+  it('has only the track to say about one that runs nothing', () => {
+    expect(said(propose(2, { kind: 'remark', text: 'A title' })).fields).toEqual([
+      { name: 'track', value: 'Track 2' },
+    ])
+  })
+
+  it('writes out a username authority by suffix as well as by account', () => {
+    const motion: Motion = {
+      kind: 'addUsernameAuthority',
+      authority: OTHER,
+      suffix: 'numen',
+      allocation: 500,
+    }
+    expect(said(propose(10, motion)).fields).toEqual([
+      { name: 'adds authority', value: 'nu2uaQW…nASg' },
+      { name: 'suffix', value: 'numen' },
+      { name: 'allocation', value: '500' },
+      { name: 'track', value: 'Track 10' },
+    ])
+  })
+})
+
+group('a validator call in the log', () => {
+  it('shortens the keys like any 0x value, and writes them out where they are signed', () => {
+    const keys = `0x${'ab'.repeat(32)}${'cd'.repeat(32)}`
+    const call: Operation = { kind: 'setKeys', keys, proof: '0x00' }
+
+    expect(said(call).fields).toEqual([{ name: 'keys', value: '0xabab…cdcd' }])
+    expect(describe(call, 'tNUMN', { whole: true }).fields).toEqual([{ name: 'keys', value: keys }])
+  })
+})
+
+group('a batch in the log', () => {
+  it('writes out every payment, since a count says nothing about where it went', () => {
+    const written = said({ kind: 'batch', calls: [pay(TO, 1n), pay(OTHER, 2n)] })
+
+    expect(written.title).toBe('Transfer')
+    expect(written.fields).toEqual([
+      { name: '1', value: '1.0000 tNUMN, nu3oNks…Co98' },
+      { name: '2', value: '2.0000 tNUMN, nu2uaQW…nASg' },
+    ])
+  })
+
+  it('reads as the call itself when it holds only one', () => {
+    expect(said({ kind: 'batch', calls: [pay(TO, 1n)] })).toEqual(said(pay(TO, 1n)))
+  })
+
+  it('names each call when they are not all the same, since the values alone would not', () => {
+    const written = said({
+      kind: 'batch',
+      calls: [
+        { kind: 'removeVote', poll: 3, track: 0 },
+        { kind: 'unlock', track: 0, target: TO },
+      ],
+    })
+
+    expect(written.title).toBe('2 calls')
+    expect(written.fields).toEqual([
+      { name: 'Take back the vote on 3', value: 'Track 0' },
+      { name: 'Unlock', value: 'Track 0, nu3oNks…Co98' },
+    ])
+  })
+
+  it('has something to say about a batch with nothing in it', () => {
+    expect(said({ kind: 'batch', calls: [] })).toEqual({ title: 'Nothing', fields: [] })
+  })
+})
+
+group('addresses in full', () => {
+  const valueOf = (described: ReturnType<typeof said>, name: string) =>
+    described.fields.find((field) => field.name === name)?.value
+
+  it('shortens by default, since the log is a record rather than a check', () => {
+    expect(valueOf(said(pay(TO, 1n)), 'to')).toBe('nu3oNks…Co98')
+  })
+
+  /** Two addresses sharing a head and a tail are cheap to come by. */
+  it('writes them out where somebody is about to sign', () => {
+    const written = describe(pay(TO, 1n), 'tNUMN', { whole: true })
+
+    expect(valueOf(written, 'to')).toBe(TO)
+  })
+
+  it('carries that down into the calls a batch holds', () => {
+    const written = describe(
+      { kind: 'batch', calls: [pay(TO, 1n), pay(OTHER, 2n)] },
+      'tNUMN',
+      { whole: true },
+    )
+
+    expect(written.fields[0]?.value).toContain(TO)
+  })
+})
+
+group('a call as the mock chain writes it out', () => {
+  const chain = createMockRepository()
+
+  it('writes out the call a multisig signature carries', async () => {
+    const { args } = await chain.callData({
+      kind: 'multisigApprove',
+      threshold: 2,
+      others: [TO, OTHER],
+      multisig: MULTISIG,
+      call: pay(TO, 1n),
+    })
+
+    expect(args).toEqual([
+      { name: 'threshold', value: '2' },
+      { name: 'others', value: `${TO}, ${OTHER}` },
+      { name: 'multisig', value: MULTISIG },
+      { name: 'call', value: `transfer to ${TO}, amount ${UNIT}` },
+    ])
+  })
+
+  it('writes out a record field by field, and none where there is nothing', async () => {
+    const delegate = await chain.callData({
+      kind: 'delegate',
+      delegation: { track: 2, to: TO, conviction: 'Locked1x', amount: UNIT },
+    })
+    const edit = await chain.callData({
+      kind: 'editMetadata',
+      poll: 3,
+      title: 'A title',
+      description: '',
+      clear: null,
+    })
+
+    expect(delegate.args).toEqual([
+      { name: 'delegation', value: `track 2, to ${TO}, conviction Locked1x, amount ${UNIT}` },
+    ])
+    expect(edit.args).toContainEqual({ name: 'clear', value: 'none' })
+  })
+})
